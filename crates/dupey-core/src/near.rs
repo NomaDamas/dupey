@@ -1,3 +1,6 @@
+use std::collections::HashSet;
+use std::hash::{DefaultHasher, Hash, Hasher};
+
 use gaoya::minhash::{compute_minhash_similarity, MinHasher, MinHasher64V1};
 use gaoya::text::whitespace_split;
 
@@ -33,11 +36,34 @@ pub fn score(a: &NearSignature, b: &NearSignature) -> f64 {
     a.jaccard(b)
 }
 
+/// Set of hashed character n-grams. Used for containment checks
+/// ("A contains B") that a Jaccard estimate cannot express.
+pub fn shingles(text: &str) -> HashSet<u64> {
+    char_ngrams(text, CHAR_NGRAM)
+        .map(|g| {
+            // DefaultHasher is deterministic across calls; RandomState is
+            // not, and would make cross-document comparison meaningless.
+            let mut h = DefaultHasher::new();
+            g.hash(&mut h);
+            h.finish()
+        })
+        .collect()
+}
+
+/// |A ∩ B| / |B|: how much of B lives inside A.
+pub fn containment(a: &HashSet<u64>, b: &HashSet<u64>) -> f64 {
+    if b.is_empty() {
+        return 0.0;
+    }
+    let shared = b.iter().filter(|g| a.contains(*g)).count();
+    shared as f64 / b.len() as f64
+}
+
 fn char_ngrams(text: &str, n: usize) -> impl Iterator<Item = String> + '_ {
     let normalized: String = whitespace_split(&text.to_lowercase()).collect::<Vec<_>>().join(" ");
     let chars: Vec<char> = normalized.chars().collect();
     let len = chars.len();
-    let take = if len < n { 1.max(len) } else { len.saturating_sub(n) + 1 };
+    let take = if len < n { usize::from(len > 0) } else { len - n + 1 };
     (0..take).map(move |i| {
         let end = (i + n).min(len);
         chars[i..end].iter().collect()
@@ -68,6 +94,21 @@ mod tests {
         let b = a.replace("3,200만 원", "3,500만 원");
         let s = score(&near_sig(&a), &near_sig(&b));
         assert!(s >= 0.85, "expected near-dup score, got {s}");
+    }
+
+    #[test]
+    fn shingles_support_containment() {
+        let draft = proposal();
+        let final_doc = format!("{draft}5. 부록\n참고 표와 체크리스트를 덧붙인다.\n");
+        let a = shingles(&final_doc);
+        let b = shingles(&draft);
+        assert!((containment(&a, &b) - 1.0).abs() < 1e-9);
+        assert!(containment(&b, &a) < 1.0);
+    }
+
+    #[test]
+    fn empty_text_has_no_shingles() {
+        assert!(shingles("").is_empty());
     }
 
     #[test]
