@@ -2,23 +2,26 @@
 
 범위가 넓어지면 파일 청소 유틸이 된다. v1은 **docx + hwpx + pdf 텍스트 + txt/md**.
 
-## 지금 (scaffold, 이 커밋)
+## 완료 (v1)
 
 - 워크스페이스: `dupey-core` + `dupey` CLI
 - `extract`: txt/md UTF-8, 줄바꿈 정규화
 - `exact_hash`: SHA-256
 - `near_sig` / `score`: gaoya MinHash 128, 글자 5-gram
-- CLI: `fingerprint`, `compare`, `scan` (scan은 포맷 라우팅만)
-- 가족 클러스터 / 정본 랭킹은 타입만
+- CLI: `fingerprint`, `compare`, `scan`
+- **docx extract** — zip + document.xml 단락 텍스트, docProps·rsId 제외, core.xml에서 내부 수정시각·revision
+- **hwpx extract** — Contents/section*.xml 본문 텍스트, content.hpf에서 dc:date
+- **pdf extract** — 임베디드 텍스트만(pdf-extract). 스캔본은 텍스트 없음으로 명시되고 가족 묶기에서 제외
+- **LSH 가족 묶기** — exact 그룹 → near 0.90 → contains. 64×2 밴드 후보 생성 + 정확 검증, contains는 크기/Jaccard 하한 게이트 + merge intersect
+- **rank** — 내부 시각(mtime보다 우선), 포함 관계, 파일명 토큰, revision, 약한 길이. 신뢰도와 이유 공개
+- CLI `dupey scan DIR --json` 이 공개 계약
+- live e2e (`scripts/e2e.sh`) + criterion 벤치 + 코퍼스 벤치 (`scripts/bench.sh`)
 
 ## 다음
 
-1. **docx extract** — zip + document.xml 단락 텍스트, docProps·rsId 제외
-2. **hwpx extract** — 본문 텍스트. hwp는 그다음
-3. **pdf extract** — 임베디드 텍스트만. 스캔본은 점수 없음으로 명시
-4. **LSH 가족 묶기** — 폴더 스캔 후 exact 그룹 → near 0.90 → contains
-5. **rank** — 내부 시각, 포함 관계, 파일명 토큰, 신뢰도와 이유
-6. CLI `dupey scan DIR --json` 이 공개 계약
+1. hwp (바이너리) extract — 한국 사무 공백
+2. pptx / xlsx extract
+3. 대규모 코퍼스에서 contains 후보 생성 개선 (bottom-k 스케치)
 
 ```text
 scan DIR

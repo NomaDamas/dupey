@@ -6,12 +6,33 @@ Office **document family** detector. Not a generic duplicate-file cleaner.
 
 Semantic embeddings are out of scope. Auto-delete is out of scope.
 
-Status: scaffold. `txt` / `md` extract + exact hash + MinHash compare work. `docx` / `hwpx` / `pdf` extract is planned.
+Status: v1 pipeline works. `txt` / `md` / `docx` / `hwpx` / `pdf` (embedded text) extract, exact + near + contains clustering, and the `scan --json` public contract are live. Legacy binary `hwp` and scanned PDFs are out of the comparable pipeline.
 
 ```bash
-cargo run -p dupey -- fingerprint notes.txt
-cargo run -p dupey -- compare 최종.txt 찐최종.txt
-cargo run -p dupey -- scan ./docs
+dupey scan ./docs --json          # the public contract
+dupey fingerprint proposal.docx   # canonical text hash + internal metadata
+dupey compare 최종.docx 찐최종.docx
+```
+
+```jsonc
+// scan DIR --json
+{
+  "files":    [{ "path", "format", "content_hash", "fuzzy", "signals" }],
+  "families": [{ "id", "files", "relation", "members",
+                 "pick": { "ranked", "reasons", "confidence" } }],
+  "errors":   [{ "path", "error" }]
+}
+```
+
+Ranking is explainable, never a verdict: internal modified time beats filesystem mtime, containment, filename tokens (`최종`/`v3` vs `복사본`/`draft`), OOXML revision, weak length — all published with a margin-based confidence (0.5 = coin flip).
+
+## Develop
+
+```bash
+cargo test --workspace            # unit + integration (real binary, real fixtures)
+./scripts/e2e.sh                  # live e2e on generated docx/hwpx/pdf corpus
+cargo bench -p dupey-core         # criterion: extract / near_sig / cluster
+./scripts/bench.sh 10             # corpus scan benchmark (10 x 100 files)
 ```
 
 Library crate: [`dupey-core`](crates/dupey-core). CLI binary: `dupey`.
