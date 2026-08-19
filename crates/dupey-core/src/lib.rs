@@ -13,6 +13,8 @@ pub mod rank;
 pub use error::{Error, Result};
 pub use exact::{exact_hash, exact_hash_hex};
 pub use extract::{extract, CanonicalText, DocMeta, Format};
-pub use family::{Family, FamilyMember, Relation};
-pub use near::{near_sig, score, NearSignature, DEFAULT_NEAR_THRESHOLD, NUM_PERM};
-pub use rank::{FamilyRanking, RankSignal, RankedMember};
+pub use family::{cluster, Family, FamilyMember, Relation, ScannedDoc};
+pub use near::{
+    containment, near_sig, score, shingles, NearSignature, DEFAULT_NEAR_THRESHOLD, NUM_PERM,
+};
+pub use rank::{rank, FamilyRanking, MemberSignals, RankSignal, RankedMember};

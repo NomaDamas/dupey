@@ -459,6 +459,8 @@ dependencies = [
  "anyhow",
  "clap",
  "dupey-core",
+ "jiff",
+ "serde",
  "serde_json",
  "walkdir",
 ]
