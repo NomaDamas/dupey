@@ -8,7 +8,7 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use crate::near::{containment, near_sig, score, shingles, NearSignature, DEFAULT_NEAR_THRESHOLD};
+use crate::near::{containment, near_sig, score, shingles, NearSignature};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]

@@ -463,6 +463,7 @@ dependencies = [
  "serde",
  "serde_json",
  "walkdir",
+ "zip",
 ]
 
 [[package]]
