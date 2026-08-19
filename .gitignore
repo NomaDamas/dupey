@@ -1,0 +1,31 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Agent tooling
+.sisyphus/
+.omo/
+.omx/
+.ralph-state/
+.worktrees/
+.ruff_cache/
+.pytest_cache/
+.venv/
+runs/
+evidence/
+prompts/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
