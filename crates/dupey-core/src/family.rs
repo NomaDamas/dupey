@@ -5,10 +5,11 @@
 //! shingle containment for the draft-inside-final case. Documents with no
 //! comparable text (e.g. scanned PDFs) never cluster.
 
-use std::collections::HashSet;
 use std::path::PathBuf;
 
-use crate::near::{containment, near_sig, score, shingles, NearSignature};
+use crate::near::{
+    containment, containment_at_least, near_sig, score, shingles, NearSignature,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -41,7 +42,7 @@ pub struct ScannedDoc {
     pub path: PathBuf,
     pub exact_hash: String,
     pub sig: NearSignature,
-    pub shingles: HashSet<u64>,
+    pub shingles: Vec<u64>,
 }
 
 impl ScannedDoc {
@@ -109,9 +110,22 @@ pub fn cluster(docs: &[ScannedDoc], threshold: f64) -> Vec<Family> {
                 uf.union(i, j);
                 continue;
             }
-            let c_ij = containment(&docs[i].shingles, &docs[j].shingles);
-            let c_ji = containment(&docs[j].shingles, &docs[i].shingles);
-            if c_ij >= threshold || c_ji >= threshold {
+            // containment(b in a) >= t requires |a| >= t|b| and
+            // Jaccard >= t|b| / (|a|+|b|-t|b|). Both are cheap gates on
+            // the (estimated) score before the merge intersect; 0.1
+            // covers MinHash estimation error at 128 perms (~2 sigma).
+            let (la, lb) = (docs[i].shingles.len() as f64, docs[j].shingles.len() as f64);
+            if la >= threshold * lb
+                && s + 0.1 >= threshold * lb / (la + lb - threshold * lb)
+                && containment_at_least(&docs[i].shingles, &docs[j].shingles, threshold)
+                    >= threshold
+            {
+                uf.union(i, j);
+            } else if lb >= threshold * la
+                && s + 0.1 >= threshold * la / (la + lb - threshold * la)
+                && containment_at_least(&docs[j].shingles, &docs[i].shingles, threshold)
+                    >= threshold
+            {
                 uf.union(i, j);
             }
         }

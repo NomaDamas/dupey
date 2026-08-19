@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::hash::{DefaultHasher, Hash, Hasher};
 
 use gaoya::minhash::{compute_minhash_similarity, MinHasher, MinHasher64V1};
@@ -36,10 +35,12 @@ pub fn score(a: &NearSignature, b: &NearSignature) -> f64 {
     a.jaccard(b)
 }
 
-/// Set of hashed character n-grams. Used for containment checks
-/// ("A contains B") that a Jaccard estimate cannot express.
-pub fn shingles(text: &str) -> HashSet<u64> {
-    char_ngrams(text, CHAR_NGRAM)
+/// Sorted, deduped hashed character n-grams. Used for containment
+/// checks ("A contains B") that a Jaccard estimate cannot express.
+/// Sorted vectors make containment a merge intersect, which stays cheap
+/// even on template-heavy corpora with many candidate pairs.
+pub fn shingles(text: &str) -> Vec<u64> {
+    let mut v: Vec<u64> = char_ngrams(text, CHAR_NGRAM)
         .map(|g| {
             // DefaultHasher is deterministic across calls; RandomState is
             // not, and would make cross-document comparison meaningless.
@@ -47,15 +48,44 @@ pub fn shingles(text: &str) -> HashSet<u64> {
             g.hash(&mut h);
             h.finish()
         })
-        .collect()
+        .collect();
+    v.sort_unstable();
+    v.dedup();
+    v
 }
 
 /// |A ∩ B| / |B|: how much of B lives inside A.
-pub fn containment(a: &HashSet<u64>, b: &HashSet<u64>) -> f64 {
+pub fn containment(a: &[u64], b: &[u64]) -> f64 {
+    containment_at_least(a, b, 0.0)
+}
+
+/// Merge-intersect containment with early exit once `threshold` becomes
+/// reachable or unreachable. containment(a, b) >= threshold ?
+/// Returns the exact containment; callers compare against the threshold.
+pub fn containment_at_least(a: &[u64], b: &[u64], threshold: f64) -> f64 {
     if b.is_empty() {
         return 0.0;
     }
-    let shared = b.iter().filter(|g| a.contains(*g)).count();
+    let needed = (b.len() as f64 * threshold).ceil() as usize;
+    let mut shared = 0usize;
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => {
+                shared += 1;
+                i += 1;
+                j += 1;
+            }
+        }
+        if threshold > 0.0 {
+            let remaining = b.len() - j;
+            if shared + remaining < needed {
+                return 0.0; // unreachable
+            }
+        }
+    }
     shared as f64 / b.len() as f64
 }
 

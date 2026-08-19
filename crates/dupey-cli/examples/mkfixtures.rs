@@ -185,9 +185,34 @@ fn main() {
     std::fs::write(dir.join("메모.txt"), "오늘 점심은 김치찌개다. 산책을 하고 일찍 잔다.").unwrap();
     std::fs::write(dir.join("scan.pdf"), b"%PDF-1.4\n").unwrap(); // broken/empty on purpose
 
-    // Filler docs for benchmarks: unrelated content, no families.
+    // Filler docs for benchmarks. Vocabulary pools keep most pairs
+    // unrelated (~0.1-0.3 Jaccard); every 10th pair shares a template,
+    // the same-company-form case (~0.6-0.8) from DIRECTION.
+    const POOLS: &[&[&str]] = &[
+        &["예산", "집행", "결산", "감사", "회계", "송금", "세금", "청구"],
+        &["일정", "마일스톤", "킥오프", "검수", "배포", "회귀", "데모", "리허설"],
+        &["인사", "채용", "면접", "평가", "승진", "교육", "연차", "조직"],
+        &["계약", "조항", "위약", "갱신", "해지", "서명", "날인", "검토"],
+        &["서버", "배치", "로그", "지표", "알림", "장애", "복구", "용량"],
+        &["디자인", "시안", "폰트", "간격", "색상", "그리드", "컴포넌트", "프로토"],
+        &["마케팅", "캠페인", "전환", "유입", "광고", "소재", "랜딩", "채널"],
+        &["법무", "규정", "준수", "신고", "허가", "등록", "변경", "공증"],
+    ];
     for i in 0..scale * 100 {
-        let body = paragraphs(&format!("필러{i}"), 8);
+        let pool = POOLS[i % POOLS.len()];
+        let body = if i % 10 == 9 {
+            // Same-company template twin of the previous doc.
+            paragraphs(&format!("양식{}", i - 1), 8)
+        } else {
+            (0..8)
+                .map(|k| {
+                    let w1 = pool[(i + k) % pool.len()];
+                    let w2 = pool[(i * 3 + k + 1) % pool.len()];
+                    format!("{w1} 항목에 대한 {i}번 문서의 {k}절: {w2} 기준과 절차를 정리하고 담당자 확인을 남긴다.")
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
         match i % 4 {
             0 => std::fs::write(dir.join(format!("filler_{i:04}.txt")), body).unwrap(),
             1 => std::fs::write(dir.join(format!("filler_{i:04}.md")), body).unwrap(),

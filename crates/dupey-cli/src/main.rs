@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use dupey_core::{
-    cluster, containment, exact_hash_hex, extract, near_sig, rank, shingles, CanonicalText,
+    cluster, containment, exact_hash_hex, extract, near_sig, rank, CanonicalText,
     Format, MemberSignals, ScannedDoc, DEFAULT_NEAR_THRESHOLD,
 };
 use serde::Serialize;
@@ -133,6 +133,7 @@ struct ScanOut {
 }
 
 fn scan(dir: &Path, json: bool, threshold: f64) -> Result<()> {
+    let t0 = std::time::Instant::now();
     let mut files: Vec<FileEntry> = Vec::new();
     let mut docs: Vec<ScannedDoc> = Vec::new();
     let mut metas: Vec<(CanonicalText, Option<jiff::Timestamp>)> = Vec::new();
@@ -182,10 +183,23 @@ fn scan(dir: &Path, json: bool, threshold: f64) -> Result<()> {
         }
     }
 
+    if std::env::var_os("DUPEY_TIMING").is_some() {
+        eprintln!("extract+sig: {:?}", t0.elapsed());
+    }
+    let t_cluster = std::time::Instant::now();
     let families = cluster(&docs, threshold);
+    if std::env::var_os("DUPEY_TIMING").is_some() {
+        eprintln!("cluster: {:?}", t_cluster.elapsed());
+    }
+    // Shingle sets are already computed in `docs`; reuse them instead of
+    // re-shingling per member pair (that made rank O(m^2) re-extraction).
+    let doc_index: std::collections::HashMap<&PathBuf, usize> = docs
+        .iter()
+        .enumerate()
+        .map(|(i, d)| (&d.path, i))
+        .collect();
     let mut family_out = Vec::new();
     for fam in &families {
-        // Map member paths back to extracted metadata for rank signals.
         let signals: Vec<MemberSignals> = fam
             .members
             .iter()
@@ -195,22 +209,20 @@ fn scan(dir: &Path, json: bool, threshold: f64) -> Result<()> {
                     .find(|(c, _)| c.path == m.path)
                     .map(|(c, t)| (c.clone(), *t))
                     .expect("family member must come from scanned docs");
-                let others: Vec<&CanonicalText> = fam
+                let my_shingles = &docs[doc_index[&m.path]].shingles;
+                let others: Vec<&Vec<u64>> = fam
                     .members
                     .iter()
                     .filter(|o| o.path != m.path)
-                    .filter_map(|o| metas.iter().find(|(c, _)| c.path == o.path))
-                    .map(|(c, _)| c)
+                    .filter_map(|o| doc_index.get(&o.path))
+                    .map(|&oi| &docs[oi].shingles)
                     .collect();
-                let my_shingles = shingles(&canon.text);
                 let contains_others = !others.is_empty()
-                    && others.iter().all(|o| {
-                        let os = shingles(&o.text);
-                        !os.is_empty() && containment(&my_shingles, &os) >= threshold
+                    && others.iter().all(|os| {
+                        !os.is_empty() && containment(my_shingles, os) >= threshold
                     });
-                let contained_by_other = others.iter().any(|o| {
-                    let os = shingles(&o.text);
-                    !my_shingles.is_empty() && containment(&os, &my_shingles) >= threshold
+                let contained_by_other = others.iter().any(|os| {
+                    !my_shingles.is_empty() && containment(os, my_shingles) >= threshold
                 });
                 MemberSignals {
                     path: m.path.clone(),

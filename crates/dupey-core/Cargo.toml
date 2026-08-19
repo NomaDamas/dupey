@@ -23,3 +23,11 @@ serde.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+criterion = { version = "0.8.2", features = ["html_reports"] }
+zip = { version = "8", default-features = false, features = ["deflate"] }
+
+[[bench]]
+name = "core"
+harness = false
