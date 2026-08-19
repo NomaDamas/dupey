@@ -12,6 +12,8 @@ pub enum Error {
     },
     #[error("file is not valid UTF-8 text: {path}")]
     InvalidUtf8 { path: PathBuf },
+    #[error("failed to extract {path}: {message}")]
+    Extract { path: PathBuf, message: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

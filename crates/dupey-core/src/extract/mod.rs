@@ -1,11 +1,21 @@
+//! Per-format extraction of canonical, comparable text.
+//!
+//! Extract strips volatile metadata (docProps, rsId, PDF creation data) so
+//! that hashing/MinHash only sees content a human would call "the same
+//! document". Scoring is shared; only extract grows per format.
+
+pub mod docx;
+pub mod hwpx;
+pub mod pdf;
+pub mod text;
+
 use std::path::{Path, PathBuf};
+
+use jiff::Timestamp;
 
 use crate::error::{Error, Result};
 
 /// File kinds dupey knows how to talk about.
-///
-/// Only `Txt` and `Markdown` are extracted in this scaffold. Other variants
-/// exist so format routing can land without changing the public enum later.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Format {
@@ -36,8 +46,22 @@ impl Format {
     }
 
     pub fn extract_ready(self) -> bool {
-        matches!(self, Self::Txt | Self::Markdown)
+        matches!(
+            self,
+            Self::Txt | Self::Markdown | Self::Docx | Self::Hwpx | Self::Pdf
+        )
     }
+}
+
+/// In-file provenance signals. Preferred over filesystem mtime, which
+/// downloads and unzip operations clobber.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DocMeta {
+    /// Internal modified timestamp (docx core.xml, hwpx content.hpf,
+    /// PDF /ModDate). None when the format carries none.
+    pub modified: Option<Timestamp>,
+    /// Save/revision counter (docx cp:revision). Weak signal.
+    pub revision: Option<u32>,
 }
 
 /// Text that is safe to hash and MinHash: volatile metadata already stripped.
@@ -46,6 +70,7 @@ pub struct CanonicalText {
     pub path: PathBuf,
     pub format: Format,
     pub text: String,
+    pub meta: DocMeta,
 }
 
 /// Keep only comparable content. Per-format extractors plug in here.
@@ -54,29 +79,17 @@ pub fn extract(path: &Path) -> Result<CanonicalText> {
         path: path.to_path_buf(),
     })?;
     match format {
-        Format::Txt | Format::Markdown => extract_utf8(path, format),
+        Format::Txt | Format::Markdown => text::extract_utf8(path, format),
+        Format::Docx => docx::extract_docx(path),
+        Format::Hwpx => hwpx::extract_hwpx(path),
+        Format::Pdf => pdf::extract_pdf(path),
         _ => Err(Error::UnsupportedFormat {
             path: path.to_path_buf(),
         }),
     }
 }
 
-fn extract_utf8(path: &Path, format: Format) -> Result<CanonicalText> {
-    let bytes = std::fs::read(path).map_err(|source| Error::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    let text = String::from_utf8(bytes).map_err(|_| Error::InvalidUtf8 {
-        path: path.to_path_buf(),
-    })?;
-    Ok(CanonicalText {
-        path: path.to_path_buf(),
-        format,
-        text: normalize_newlines(&text),
-    })
-}
-
-fn normalize_newlines(text: &str) -> String {
+pub(crate) fn normalize_newlines(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
@@ -92,12 +105,16 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_crlf() {
-        let dir = std::env::temp_dir();
-        let path = dir.join("dupey-extract-test.txt");
-        std::fs::write(&path, "a\r\nb\rc\n").unwrap();
-        let got = extract(&path).unwrap();
-        assert_eq!(got.text, "a\nb\nc\n");
-        let _ = std::fs::remove_file(&path);
+    fn extract_ready_formats() {
+        for f in [
+            Format::Txt,
+            Format::Markdown,
+            Format::Docx,
+            Format::Hwpx,
+            Format::Pdf,
+        ] {
+            assert!(f.extract_ready(), "{f:?} should be extract-ready");
+        }
+        assert!(!Format::Hwp.extract_ready());
     }
 }
