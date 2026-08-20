@@ -58,12 +58,69 @@ pub(crate) fn extract_hwp(path: &Path) -> Result<CanonicalText> {
         text.push_str(&section_text(&body));
     }
 
+    let meta = summary_meta(path, &mut ole);
+
     Ok(CanonicalText {
         path: path.to_path_buf(),
         format: Format::Hwp,
         text,
-        meta: DocMeta::default(), // binary hwp summary info is skipped for now
+        meta,
     })
+}
+
+/// \005HwpSummaryInformation: OLE property set. We read PIDSI_EDITTIME
+/// (10, VT_FILETIME) as the internal modified-time signal.
+fn summary_meta(path: &Path, ole: &mut cfb::CompoundFile<std::fs::File>) -> DocMeta {
+    let mut meta = DocMeta::default();
+    let Ok(mut stream) = ole.open_stream("/\u{5}HwpSummaryInformation") else {
+        return meta;
+    };
+    let mut buf = Vec::new();
+    if stream.read_to_end(&mut buf).is_err() || buf.len() < 48 {
+        return meta;
+    }
+    // Header: byte order, version, system id, clsid, set count, fmtid,
+    // section offset. Minimal validation; a malformed stream yields None.
+    if u16::from_le_bytes([buf[0], buf[1]]) != 0xFFFE {
+        return meta;
+    }
+    let section_off = u32::from_le_bytes(buf[44..48].try_into().unwrap()) as usize;
+    if section_off + 8 > buf.len() {
+        return meta;
+    }
+    let prop_count =
+        u32::from_le_bytes(buf[section_off + 4..section_off + 8].try_into().unwrap()) as usize;
+    for i in 0..prop_count {
+        let entry = section_off + 8 + i * 8;
+        if entry + 8 > buf.len() {
+            return meta;
+        }
+        let prop_id = u32::from_le_bytes(buf[entry..entry + 4].try_into().unwrap());
+        let value_off =
+            section_off + u32::from_le_bytes(buf[entry + 4..entry + 8].try_into().unwrap()) as usize;
+        if prop_id != 10 || value_off + 12 > buf.len() {
+            continue;
+        }
+        let vt = u32::from_le_bytes(buf[value_off..value_off + 4].try_into().unwrap());
+        if vt != 0x0040 {
+            // VT_FILETIME
+            return meta;
+        }
+        let ft = u64::from_le_bytes(buf[value_off + 4..value_off + 12].try_into().unwrap());
+        meta.modified = filetime_to_timestamp(ft);
+        return meta;
+    }
+    let _ = path;
+    meta
+}
+
+/// Windows FILETIME (100ns ticks since 1601-01-01 UTC) -> Timestamp.
+fn filetime_to_timestamp(ft: u64) -> Option<jiff::Timestamp> {
+    const TICKS_PER_SEC: u64 = 10_000_000;
+    const EPOCH_OFFSET_SECS: i64 = 11_644_473_600; // 1601 -> 1970
+    let secs = (ft / TICKS_PER_SEC) as i64 - EPOCH_OFFSET_SECS;
+    let nanos = ((ft % TICKS_PER_SEC) * 100) as i64;
+    jiff::Timestamp::new(secs, nanos as i32).ok()
 }
 
 fn extract_err(path: &Path, e: impl std::fmt::Display) -> Error {
@@ -162,9 +219,41 @@ pub(crate) mod tests {
         out
     }
 
+    /// OLE property set stream with a single VT_FILETIME property.
+    fn property_set(prop_id: u32, filetime: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        // byte order + version + system id + clsid
+        out.extend_from_slice(&0xFFFEu16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0x0A20u32.to_le_bytes());
+        out.extend_from_slice(&[0u8; 16]);
+        out.extend_from_slice(&1u32.to_le_bytes()); // num property sets
+        out.extend_from_slice(&[0u8; 16]); // FMTID0
+        let section_offset = 48u32;
+        out.extend_from_slice(&section_offset.to_le_bytes());
+        // section; offsets inside it are relative to the section start
+        let props_start = 8u32; // section size + prop count
+        let value_offset = props_start + 8; // after one id/offset entry
+        let section_size = value_offset + 12; // VT_FILETIME: type + u64 + pad
+        out.extend_from_slice(&section_size.to_le_bytes());
+        out.extend_from_slice(&1u32.to_le_bytes()); // prop count
+        out.extend_from_slice(&prop_id.to_le_bytes());
+        out.extend_from_slice(&value_offset.to_le_bytes());
+        out.extend_from_slice(&0x0040u32.to_le_bytes()); // VT_FILETIME
+        out.extend_from_slice(&filetime.to_le_bytes());
+        out
+    }
+
+    /// 2026-08-01T09:00:00Z as a Windows FILETIME (100ns since 1601).
+    const FILETIME_2026_08_01: u64 = 0x01DD_2194_21FB_A800;
+
     /// Minimal real HWP 5.x file: CFB container with a FileHeader whose
     /// flags say BodyText sections are stored uncompressed.
     pub(crate) fn make_hwp(paras: &[&str]) -> Vec<u8> {
+        make_hwp_with_summary(paras, None)
+    }
+
+    pub(crate) fn make_hwp_with_summary(paras: &[&str], edittime: Option<u64>) -> Vec<u8> {
         let section = section_stream(paras);
         let mut header = vec![0u8; 256];
         header[0..32].copy_from_slice(b"HWP Document File\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0");
@@ -181,6 +270,12 @@ pub(crate) mod tests {
             let mut s = ole.create_stream("BodyText/Section0").unwrap();
             s.write_all(&section).unwrap();
         }
+        if let Some(ft) = edittime {
+            let mut s = ole
+                .create_stream("\u{5}HwpSummaryInformation")
+                .unwrap();
+            s.write_all(&property_set(10, ft)).unwrap();
+        }
         ole.into_inner().into_inner()
     }
 
@@ -194,6 +289,27 @@ pub(crate) mod tests {
             got.text,
             "사업 계획서\n예산은 3,200만 원이다.\n일정은 9월 시작.\n"
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn reads_summary_edit_time() {
+        let bytes = make_hwp_with_summary(&["a"], Some(FILETIME_2026_08_01));
+        let path = write_tmp("dupey-hwp-meta.hwp", &bytes);
+        let got = extract_hwp(&path).unwrap();
+        assert_eq!(
+            got.meta.modified.unwrap().to_string(),
+            "2026-08-01T09:00:00Z"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn missing_summary_is_no_meta() {
+        let bytes = make_hwp(&["a"]);
+        let path = write_tmp("dupey-hwp-nometa.hwp", &bytes);
+        let got = extract_hwp(&path).unwrap();
+        assert_eq!(got.meta.modified, None);
         let _ = std::fs::remove_file(&path);
     }
 
