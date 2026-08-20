@@ -335,8 +335,8 @@ mod tests {
 
     #[test]
     fn date_cells_become_iso_dates() {
-        // 46252 = 2026-08-01 in the 1900 date system.
-        let bytes = make_xlsx_with_dates(&["마감"], &[(0, 46252.0)], "2026-08-01T09:00:00Z");
+        // 46235 = 2026-08-01 in the 1900 date system.
+        let bytes = make_xlsx_with_dates(&["마감"], &[(0, 46235.0)], "2026-08-01T09:00:00Z");
         let path = write_tmp("dupey-xlsx-date.xlsx", &bytes);
         let got = extract_xlsx(&path).unwrap();
         assert!(got.text.contains("마감"));
