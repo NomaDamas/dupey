@@ -164,11 +164,10 @@ fn serial_to_date(serial: f64) -> Option<String> {
         return None;
     }
     let days = serial.floor() as i64;
-    let mut d = days;
-    if days >= 60 {
-        d -= 1; // Excel counts 1900-02-29 which does not exist
-    }
-    let secs = (d - 25569) * 86400 + ((serial - serial.floor()) * 86400.0).round() as i64;
+    // Excel serial 1 = 1900-01-01, with the fictitious 1900-02-29
+    // counted, so 25569 days  -> 1970-01-01 already includes the bug
+    // for dates past 1900-02-28. No extra adjustment needed.
+    let secs = (days - 25569) * 86400 + ((serial - serial.floor()) * 86400.0).round() as i64;
     let ts = jiff::Timestamp::from_second(secs).ok()?;
     let zoned = ts.to_zoned(jiff::tz::TimeZone::UTC);
     let frac = serial - serial.floor();
