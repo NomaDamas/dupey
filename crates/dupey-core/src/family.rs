@@ -36,6 +36,11 @@ pub struct Family {
     pub members: Vec<FamilyMember>,
 }
 
+/// Bottom-k sketch width: k smallest shingle hashes per document.
+/// If one document's k-sketch is a subset of another's shingles, it is a
+/// containment candidate (recall-friendly; candidates are verified).
+pub const SKETCH_K: usize = 64;
+
 /// One scanned document ready for clustering.
 #[derive(Debug, Clone)]
 pub struct ScannedDoc {
@@ -43,15 +48,20 @@ pub struct ScannedDoc {
     pub exact_hash: String,
     pub sig: NearSignature,
     pub shingles: Vec<u64>,
+    /// k smallest shingle hashes; inverted index key for containment
+    /// candidate generation.
+    pub sketch: Vec<u64>,
 }
 
 impl ScannedDoc {
     pub fn from_text(path: PathBuf, text: &str) -> Self {
+        let shingles = shingles(text);
         Self {
             path,
             exact_hash: crate::exact_hash_hex(text),
             sig: near_sig(text),
-            shingles: shingles(text),
+            sketch: shingles.iter().take(SKETCH_K).copied().collect(),
+            shingles,
         }
     }
 
@@ -90,7 +100,9 @@ pub fn cluster(docs: &[ScannedDoc], threshold: f64) -> Vec<Family> {
         }
     }
 
-    // near / contains: LSH candidates, verified exactly.
+    // near / contains: candidate generation, every candidate verified.
+    // LSH covers near; a bottom-k inverted index covers containment of
+    // documents too small for LSH bands to see (draft inside final).
     let mut index = gaoya::minhash::MinHashIndex::new(
         LSH_BANDS,
         LSH_BAND_WIDTH,
@@ -99,35 +111,62 @@ pub fn cluster(docs: &[ScannedDoc], threshold: f64) -> Vec<Family> {
     for &i in &comp {
         index.insert(i, docs[i].sig.values.clone());
     }
+
+    let mut sketch_postings: std::collections::HashMap<u64, Vec<usize>> =
+        std::collections::HashMap::new();
     for &i in &comp {
-        for j in index.query(&docs[i].sig.values) {
-            let j = *j;
-            if j <= i || uf.find(i) == uf.find(j) {
-                continue;
+        for &h in &docs[i].sketch {
+            sketch_postings.entry(h).or_default().push(i);
+        }
+    }
+
+    let mut candidates: std::collections::BTreeSet<(usize, usize)> =
+        std::collections::BTreeSet::new();
+    for &i in &comp {
+        for &j in index.query(&docs[i].sig.values) {
+            if j != i {
+                candidates.insert((i.min(j), i.max(j)));
             }
-            let s = score(&docs[i].sig, &docs[j].sig);
-            if s >= threshold {
-                uf.union(i, j);
-                continue;
+        }
+    }
+    for &i in &comp {
+        for &h in &docs[i].sketch {
+            if let Some(posting) = sketch_postings.get(&h) {
+                for &j in posting {
+                    if j != i {
+                        candidates.insert((i.min(j), i.max(j)));
+                    }
+                }
             }
-            // containment(b in a) >= t requires |a| >= t|b| and
-            // Jaccard >= t|b| / (|a|+|b|-t|b|). Both are cheap gates on
-            // the (estimated) score before the merge intersect; 0.1
-            // covers MinHash estimation error at 128 perms (~2 sigma).
-            let (la, lb) = (docs[i].shingles.len() as f64, docs[j].shingles.len() as f64);
-            if la >= threshold * lb
-                && s + 0.1 >= threshold * lb / (la + lb - threshold * lb)
-                && containment_at_least(&docs[i].shingles, &docs[j].shingles, threshold)
-                    >= threshold
-            {
-                uf.union(i, j);
-            } else if lb >= threshold * la
-                && s + 0.1 >= threshold * la / (la + lb - threshold * la)
-                && containment_at_least(&docs[j].shingles, &docs[i].shingles, threshold)
-                    >= threshold
-            {
-                uf.union(i, j);
-            }
+        }
+    }
+
+    for (i, j) in candidates {
+        if uf.find(i) == uf.find(j) {
+            continue;
+        }
+        let s = score(&docs[i].sig, &docs[j].sig);
+        if s >= threshold {
+            uf.union(i, j);
+            continue;
+        }
+        // containment(b in a) >= t requires |a| >= t|b| and
+        // Jaccard >= t|b| / (|a|+|b|-t|b|). Both are cheap gates on
+        // the (estimated) score before the merge intersect; 0.1
+        // covers MinHash estimation error at 128 perms (~2 sigma).
+        let (la, lb) = (docs[i].shingles.len() as f64, docs[j].shingles.len() as f64);
+        if la >= threshold * lb
+            && s + 0.1 >= threshold * lb / (la + lb - threshold * lb)
+            && containment_at_least(&docs[i].shingles, &docs[j].shingles, threshold)
+                >= threshold
+        {
+            uf.union(i, j);
+        } else if lb >= threshold * la
+            && s + 0.1 >= threshold * la / (la + lb - threshold * la)
+            && containment_at_least(&docs[j].shingles, &docs[i].shingles, threshold)
+                >= threshold
+        {
+            uf.union(i, j);
         }
     }
 
@@ -327,6 +366,39 @@ mod tests {
         let fams = cluster(&docs, DEFAULT_NEAR_THRESHOLD);
         assert_eq!(fams.len(), 1);
         assert_eq!(fams[0].members.len(), 3);
+    }
+
+    #[test]
+    fn contains_found_even_when_lsh_misses() {
+        // A draft inside a much larger final: Jaccard is far below the
+        // near threshold, so LSH alone can miss the pair. The bottom-k
+        // sketch index must surface it as a containment candidate.
+        let draft = paragraphs("초안", 10);
+        let mut final_doc = draft.clone();
+        for pool in 0..30 {
+            final_doc.push('\n');
+            final_doc.push_str(&paragraphs(&format!("부록{pool}"), 8));
+        }
+        let docs = vec![doc("초안.docx", &draft), doc("최종.docx", &final_doc)];
+        let fams = cluster(&docs, DEFAULT_NEAR_THRESHOLD);
+        assert_eq!(fams.len(), 1, "draft in big final must cluster via sketch");
+        assert!(fams[0]
+            .members
+            .iter()
+            .any(|m| m.relation == Relation::Contains));
+    }
+
+    #[test]
+    fn sketch_size_bounded() {
+        let big = paragraphs("대형", 2000);
+        let d = doc("big.txt", &big);
+        assert_eq!(d.sketch.len(), SKETCH_K);
+    }
+
+    #[test]
+    fn sketch_is_prefix_of_sorted_shingles() {
+        let d = doc("a.txt", &paragraphs("x", 20));
+        assert_eq!(d.sketch, d.shingles[..d.sketch.len()].to_vec());
     }
 
     #[test]
