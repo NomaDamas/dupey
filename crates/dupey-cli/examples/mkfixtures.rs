@@ -97,14 +97,23 @@ fn write_hwpx(path: &Path, paragraphs: &[&str], date: &str) {
 
 fn write_hwp(path: &Path, paras: &[&str]) {
     let mut section = Vec::new();
-    for p in paras {
-        let mut utf16: Vec<u8> = p.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+    let mut put_record = |tag: u16, level: u32, text: &str| {
+        let mut utf16: Vec<u8> = text.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
         while utf16.len() % 4 != 0 {
             utf16.extend_from_slice(&0u16.to_le_bytes());
         }
-        let header: u32 = 67u32 | ((utf16.len() as u32 / 4) << 20);
+        let header: u32 = tag as u32 | (level << 10) | ((utf16.len() as u32 / 4) << 20);
         section.extend_from_slice(&header.to_le_bytes());
         section.extend_from_slice(&utf16);
+    };
+    for p in paras {
+        put_record(67, 0, p);
+    }
+    // A small table so e2e exercises nested (cell) paragraphs too.
+    put_record(75, 0, ""); // TABLE
+    for cell in ["항목", "금액", "인건비", "1,200"] {
+        put_record(72, 1, ""); // LIST_HEADER
+        put_record(67, 2, cell);
     }
     let mut header = vec![0u8; 256];
     header[0..32].copy_from_slice(b"HWP Document File\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0");

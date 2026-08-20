@@ -102,7 +102,11 @@ if fam7:
     check("xlsx pick is v2 (internal time)",
           fam7["pick"]["ranked"][0]["path"].endswith("예산표_v2.xlsx"))
 
-# 11. scanned pdf: no fuzzy signature, reported or skipped gracefully
+# 11. hwp family is still one family after table records join the text
+fam11 = family_of("운영계획_최종.hwp")
+check("hwp family still forms with table cells", fam11 is not None)
+
+# 12. scanned pdf: no fuzzy signature, reported or skipped gracefully
 scanpdf = files.get("scan.pdf")
 if scanpdf:
     check("scanned pdf has no fuzzy", scanpdf["fuzzy"] is None)

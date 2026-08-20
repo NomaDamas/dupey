@@ -151,14 +151,20 @@ fn inflate(path: &Path, raw: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Walk section records; collect UTF-16LE text of HWPTAG_PARA_TEXT,
-/// dropping control placeholders, one line per paragraph record.
+const HWPTAG_LIST_HEADER: u16 = 72;
+
+/// Walk section records; collect UTF-16LE text of HWPTAG_PARA_TEXT at
+/// any level (table cells are nested PARA_TEXT), dropping control
+/// placeholders. Table cell boundaries (LIST_HEADER) become tabs so cell
+/// text survives as comparable content; one line per paragraph record.
 fn section_text(body: &[u8]) -> String {
     let mut out = String::new();
     let mut pos = 0usize;
+    let mut cells_in_row = 0usize;
     while pos + 4 <= body.len() {
         let header = u32::from_le_bytes(body[pos..pos + 4].try_into().unwrap());
         let tag_id = (header & 0x3FF) as u16;
+        let level = (header >> 10) & 0x3FF;
         let mut size = ((header >> 20) & 0xFFF) as usize * 4;
         pos += 4;
         if size == 0xFFF * 4 {
@@ -171,17 +177,31 @@ fn section_text(body: &[u8]) -> String {
         if pos + size > body.len() {
             break;
         }
-        if tag_id == HWPTAG_PARA_TEXT {
-            for chunk in body[pos..pos + size].chunks_exact(2) {
-                let c = u16::from_le_bytes([chunk[0], chunk[1]]);
-                match c {
-                    // Control placeholders: fields/tables/objects. Only
-                    // real prose characters survive extract.
-                    0x0000..=0x001F | 0xE000..=0xF8FF => {}
-                    _ => out.push(char::from_u32(c as u32).unwrap_or('\u{FFFD}')),
+        match tag_id {
+            HWPTAG_PARA_TEXT => {
+                if level > 0 {
+                    // Nested paragraph: a table cell's text. Tabs between
+                    // cells instead of the paragraph newline.
+                    if cells_in_row > 0 && out.ends_with('\n') {
+                        out.pop();
+                        out.push('\t');
+                    }
+                    cells_in_row += 1;
+                } else {
+                    cells_in_row = 0;
                 }
+                for chunk in body[pos..pos + size].chunks_exact(2) {
+                    let c = u16::from_le_bytes([chunk[0], chunk[1]]);
+                    match c {
+                        // Control placeholders: fields/objects. Only real
+                        // prose characters survive extract.
+                        0x0000..=0x001F | 0xE000..=0xF8FF => {}
+                        _ => out.push(char::from_u32(c as u32).unwrap_or('\u{FFFD}')),
+                    }
+                }
+                out.push('\n');
             }
-            out.push('\n');
+            _ => {}
         }
         pos += size;
     }
@@ -310,6 +330,68 @@ pub(crate) mod tests {
         let path = write_tmp("dupey-hwp-nometa.hwp", &bytes);
         let got = extract_hwp(&path).unwrap();
         assert_eq!(got.meta.modified, None);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Section stream with a table: TABLE record followed by cell
+    /// LIST_HEADER/PARA_TEXT chains at deeper levels.
+    fn section_stream_with_table(before: &str, cells: &[&str], after: &str) -> Vec<u8> {
+        const TABLE: u16 = 75;
+        const LIST_HEADER: u16 = 72;
+        let mut out = Vec::new();
+        let mut put = |tag: u16, level: u32, text: &str| {
+            let mut utf16: Vec<u8> = text.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+            while utf16.len() % 4 != 0 {
+                utf16.extend_from_slice(&0u16.to_le_bytes());
+            }
+            let header: u32 = tag as u32 | (level << 10) | ((utf16.len() as u32 / 4) << 20);
+            out.extend_from_slice(&header.to_le_bytes());
+            out.extend_from_slice(&utf16);
+        };
+        put(BODYTEXT_PARA_TEXT, 0, before);
+        put(TABLE, 0, "");
+        for cell in cells {
+            put(LIST_HEADER, 1, "");
+            put(BODYTEXT_PARA_TEXT, 2, cell);
+        }
+        put(BODYTEXT_PARA_TEXT, 0, after);
+        out
+    }
+
+    #[test]
+    fn table_cells_are_extracted() {
+        let mut header = vec![0u8; 256];
+        header[0..32].copy_from_slice(b"HWP Document File\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0");
+        header[32..36].copy_from_slice(&0x00050100u32.to_le_bytes());
+        let section = section_stream_with_table(
+            "예산 내역",
+            &["인건비", "1,200", "서버비", "340"],
+            "이상.",
+        );
+        let cursor = std::io::Cursor::new(Vec::new());
+        let mut ole = cfb::CompoundFile::create(cursor).unwrap();
+        {
+            let mut s = ole.create_stream("FileHeader").unwrap();
+            s.write_all(&header).unwrap();
+        }
+        ole.create_storage("BodyText").unwrap();
+        {
+            let mut s = ole.create_stream("BodyText/Section0").unwrap();
+            s.write_all(&section).unwrap();
+        }
+        let path = write_tmp("dupey-hwp-table.hwp", &ole.into_inner().into_inner());
+        let got = extract_hwp(&path).unwrap();
+        assert!(got.text.contains("예산 내역"), "{:?}", got.text);
+        for cell in ["인건비", "1,200", "서버비", "340"] {
+            assert!(got.text.contains(cell), "missing cell {cell:?} in {:?}", got.text);
+        }
+        assert!(got.text.contains("이상."), "{:?}", got.text);
+        // Cells are tab-separated like xlsx rows.
+        assert!(
+            got.text.contains("인건비\t1,200\t서버비\t340"),
+            "cells should be tab-separated: {:?}",
+            got.text
+        );
         let _ = std::fs::remove_file(&path);
     }
 
