@@ -17,16 +17,17 @@
 - CLI `dupey scan DIR --json` 이 공개 계약
 - live e2e (`scripts/e2e.sh`) + criterion 벤치 + 코퍼스 벤치 (`scripts/bench.sh`)
 
-- **hwp (바이너리) extract** — CFB + FileHeader 플래그 + deflate + HWPTAG_PARA_TEXT(UTF-16LE, 제어 문자 제거)
+- **hwp (바이너리) extract** — CFB + FileHeader 플래그 + deflate + HWPTAG_PARA_TEXT(UTF-16LE, 제어 문자 제거), \\005HwpSummaryInformation의 PIDSI_EDITTIME을 내부 수정시각으로
 - **pptx extract** — 슬라이드 a:t 텍스트(슬라이드 순), 발표자 노트 제외
-- **xlsx extract** — 셀 값(공유 문자열 해석), 행 단위 탭 구분, calcChain 무시
-- **contains 후보 개선** — bottom-k 스케치 (위 가족 묶기에 포함)
+- **xlsx extract** — 셀 값(공유 문자열 해석), 행 단위 탭 구분, calcChain 무시, 날짜 서식 셀은 시리얼→ISO 날짜
+- **contains 후보 개선** — bottom-k 스케치(k=64, df≤64 필터)
+- **병렬 extract** — scan의 extract+해시+시그니처 구간을 rayon으로 병렬화 (순서 보존)
 
 ## 다음
 
-1. hwp summary metadata(\\005HwpSummaryInformation)에서 내부 수정시각 읽기
-2. 대용량 폴더 병렬 extract (병목은 파일 I/O)
-3. xlsx 날짜/숫자 서식 없는 셀의 로캘 안정화
+1. 대규모(10만+) 코퍼스에서 contains 정밀도 회귀 감시
+2. 스캔 pdf에 대한 OCR 브리지는 범위 밖 (문서화만)
+3. hwp 표/필드 내부 텍스트 추출 여부 결정
 
 ```text
 scan DIR

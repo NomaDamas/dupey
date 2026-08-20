@@ -150,15 +150,25 @@ fn scan(dir: &Path, json: bool, threshold: f64) -> Result<()> {
     }
     paths.sort();
 
-    for path in paths {
-        match extract(&path) {
-            Ok(canon) => {
-                let fs_mtime = std::fs::metadata(&path)
-                    .and_then(|m| m.modified())
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .and_then(|d| jiff::SignedDuration::try_from(d).ok())
-                    .and_then(|d| jiff::Timestamp::from_duration(d).ok());
+    // Extract + hash + signature is the scan bottleneck; it is pure I/O
+    // and CPU per file, so it parallelizes cleanly. Order is preserved.
+    use rayon::prelude::*;
+    let results: Vec<dupey_core::Result<(CanonicalText, Option<jiff::Timestamp>)>> = paths
+        .par_iter()
+        .map(|path| {
+            let canon = extract(path)?;
+            let fs_mtime = std::fs::metadata(path)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .and_then(|d| jiff::SignedDuration::try_from(d).ok())
+                .and_then(|d| jiff::Timestamp::from_duration(d).ok());
+            Ok((canon, fs_mtime))
+        })
+        .collect();
+    for (path, result) in paths.iter().zip(results) {
+        match result {
+            Ok((canon, fs_mtime)) => {
                 let sig = near_sig(&canon.text);
                 let fuzzy = (!canon.text.is_empty()).then(|| sig.values.clone());
                 files.push(FileEntry {

@@ -24,6 +24,7 @@ quick-xml = "0.41.0"
 serde.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
+walkdir.workspace = true
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]

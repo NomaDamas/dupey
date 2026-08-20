@@ -78,12 +78,13 @@ impl ScannedDoc {
 /// only cost recall, never precision. Contains candidates need the loose
 /// threshold: a draft inside a final can sit at Jaccard 0.5-0.7.
 pub fn cluster(docs: &[ScannedDoc], threshold: f64) -> Vec<Family> {
-    // gaoya requires bands x width == signature length (128). 64x2
-    // favors recall at the low Jaccard containment lives at (~0.45-0.7);
-    // every candidate is verified exactly afterwards.
-    const LSH_BANDS: usize = 64;
-    const LSH_BAND_WIDTH: usize = 2;
-    const LSH_CANDIDATE_THRESHOLD: f64 = 0.3;
+    // gaoya requires bands x width == signature length (128). 32x4
+    // keeps template pairs (~0.8 Jaccard) from flooding candidates;
+    // containment recall is covered by the bottom-k sketch index, so
+    // LSH only needs to be reliable at the near threshold.
+    const LSH_BANDS: usize = 32;
+    const LSH_BAND_WIDTH: usize = 4;
+    const LSH_CANDIDATE_THRESHOLD: f64 = 0.5;
 
     let comp: Vec<usize> = (0..docs.len()).filter(|&i| docs[i].comparable()).collect();
     let mut uf = UnionFind::new(docs.len());
@@ -119,9 +120,11 @@ pub fn cluster(docs: &[ScannedDoc], threshold: f64) -> Vec<Family> {
             sketch_postings.entry(h).or_default().push(i);
         }
     }
-    // Drop ubiquitous sketch values (padding shingles, shared boilerplate):
-    // they explode postings without discriminating anything.
-    let max_df = (comp.len() / 2).max(10);
+    // Drop ubiquitous sketch values (padding shingles, shared
+    // boilerplate): containment at 0.9 needs hundreds of shared
+    // shingles, so a value present in many docs discriminates nothing.
+    // The 64-doc cap keeps draft-vs-many-revisions queries intact.
+    let max_df = 64;
     sketch_postings.retain(|_, posting| posting.len() <= max_df);
 
     let mut candidates: std::collections::BTreeSet<(usize, usize)> =
@@ -157,23 +160,30 @@ pub fn cluster(docs: &[ScannedDoc], threshold: f64) -> Vec<Family> {
             uf.union(i, j);
             continue;
         }
-        // containment(b in a) >= t requires |a| >= t|b| and
-        // Jaccard >= t|b| / (|a|+|b|-t|b|). Both are cheap gates on
-        // the (estimated) score before the merge intersect; 0.1
-        // covers MinHash estimation error at 128 perms (~2 sigma).
+        // Cheap necessary conditions before the merge intersect:
+        // containment(b in a) >= t needs |a| >= t|b| and, since matching
+        // minima land in both signatures, a MinHash estimate at least
+        // ~t. The 0.1/0.2 slack covers 128-perm estimation error; the
+        // full intersect decides.
         let (la, lb) = (docs[i].shingles.len() as f64, docs[j].shingles.len() as f64);
         if la >= threshold * lb
             && s + 0.1 >= threshold * lb / (la + lb - threshold * lb)
-            && containment_at_least(&docs[i].shingles, &docs[j].shingles, threshold)
-                >= threshold
+            && s >= threshold - 0.5
         {
-            uf.union(i, j);
-        } else if lb >= threshold * la
+            let c = containment_at_least(&docs[i].shingles, &docs[j].shingles, threshold);
+            if c >= threshold {
+                uf.union(i, j);
+                continue;
+            }
+        }
+        if lb >= threshold * la
             && s + 0.1 >= threshold * la / (la + lb - threshold * la)
-            && containment_at_least(&docs[j].shingles, &docs[i].shingles, threshold)
-                >= threshold
+            && s >= threshold - 0.5
         {
-            uf.union(i, j);
+            let c = containment_at_least(&docs[j].shingles, &docs[i].shingles, threshold);
+            if c >= threshold {
+                uf.union(i, j);
+            }
         }
     }
 
@@ -429,3 +439,5 @@ mod tests {
         assert_ne!(fams[0].id, fams[1].id);
     }
 }
+
+

@@ -570,6 +570,7 @@ dependencies = [
  "clap",
  "dupey-core",
  "jiff",
+ "rayon",
  "serde",
  "serde_json",
  "walkdir",
@@ -592,6 +593,7 @@ dependencies = [
  "serde",
  "sha2 0.10.9",
  "thiserror",
+ "walkdir",
  "zip",
 ]
 
