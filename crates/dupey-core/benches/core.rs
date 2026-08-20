@@ -79,16 +79,28 @@ fn bench_near(c: &mut Criterion) {
 fn bench_cluster(c: &mut Criterion) {
     let mut g = c.benchmark_group("cluster");
     g.sample_size(20);
+    const POOLS: &[&[&str]] = &[
+        &["예산", "집행", "결산", "감사", "회계", "송금", "세금", "청구"],
+        &["일정", "마일스톤", "킥오프", "검수", "배포", "회귀", "데모", "리허설"],
+        &["인사", "채용", "면접", "평가", "승진", "교육", "연차", "조직"],
+        &["계약", "조항", "위약", "갱신", "해지", "서명", "날인", "검토"],
+        &["서버", "배치", "로그", "지표", "알림", "장애", "복구", "용량"],
+    ];
     for n in [100, 500] {
-        // Half near-dup pairs (edits), half unrelated: realistic team folder.
+        // Near-dup pairs (edits) on per-pool vocabulary, rest unrelated:
+        // realistic team folder.
         let docs: Vec<ScannedDoc> = (0..n)
             .map(|i| {
-                let base = paragraphs(&format!("문서{}", i / 2), 20);
-                let text = if i % 2 == 0 {
-                    base
-                } else {
-                    base.replace("1번째", "첫번째")
-                };
+                let pool = POOLS[i % POOLS.len()];
+                let doc = (0..20)
+                    .map(|k| {
+                        let w1 = pool[(i + k) % pool.len()];
+                        let w2 = pool[(i * 3 + k + 1) % pool.len()];
+                        format!("{w1} 항목 {i}번 문서 {k}절: {w2} 기준과 절차를 정리한다.")
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let text = if i % 2 == 0 { doc } else { doc.replace("정리한다", "정리했다") };
                 ScannedDoc::from_text(PathBuf::from(format!("d{i}.docx")), &text)
             })
             .collect();

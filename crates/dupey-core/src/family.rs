@@ -119,6 +119,10 @@ pub fn cluster(docs: &[ScannedDoc], threshold: f64) -> Vec<Family> {
             sketch_postings.entry(h).or_default().push(i);
         }
     }
+    // Drop ubiquitous sketch values (padding shingles, shared boilerplate):
+    // they explode postings without discriminating anything.
+    let max_df = (comp.len() / 2).max(10);
+    sketch_postings.retain(|_, posting| posting.len() <= max_df);
 
     let mut candidates: std::collections::BTreeSet<(usize, usize)> =
         std::collections::BTreeSet::new();
@@ -133,7 +137,10 @@ pub fn cluster(docs: &[ScannedDoc], threshold: f64) -> Vec<Family> {
         for &h in &docs[i].sketch {
             if let Some(posting) = sketch_postings.get(&h) {
                 for &j in posting {
-                    if j != i {
+                    // Skip pairs already unioned by LSH/exact; popular
+                    // sketch values otherwise make candidate collection
+                    // quadratic on template-heavy corpora.
+                    if j != i && uf.find(i) != uf.find(j) {
                         candidates.insert((i.min(j), i.max(j)));
                     }
                 }

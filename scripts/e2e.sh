@@ -79,7 +79,30 @@ check("crlf copy hashes identically",
 # 7. unrelated memo: in no family, and near score vs proposal < 0.3
 check("unrelated memo in no family", family_of("메모.txt") is None)
 
-# 8. scanned pdf: no fuzzy signature, reported or skipped gracefully
+# 8. hwp one-line edit: near >= 0.85, 최종 pick
+fam5 = family_of("운영계획_최종.hwp")
+check("hwp family exists", fam5 is not None)
+if fam5:
+    m = member(fam5, "운영계획_최종.hwp")
+    check("hwp one-line edit near >= 0.85", (m["near_score"] or 0) >= 0.85,
+          f"near_score={m['near_score']:.3f}")
+    check("hwp pick is 최종", fam5["pick"]["ranked"][0]["path"].endswith("운영계획_최종.hwp"))
+
+# 9. pptx identical slides => exact family
+fam6 = family_of("발표자료_복사본.pptx")
+check("pptx exact family", fam6 is not None and fam6["relation"] == "exact")
+
+# 10. xlsx one-cell edit: near >= 0.85, later internal time wins
+fam7 = family_of("예산표_v2.xlsx")
+check("xlsx family exists", fam7 is not None)
+if fam7:
+    m = member(fam7, "예산표_v2.xlsx")
+    check("xlsx one-cell edit near >= 0.85", (m["near_score"] or 0) >= 0.85,
+          f"near_score={m['near_score']:.3f}")
+    check("xlsx pick is v2 (internal time)",
+          fam7["pick"]["ranked"][0]["path"].endswith("예산표_v2.xlsx"))
+
+# 11. scanned pdf: no fuzzy signature, reported or skipped gracefully
 scanpdf = files.get("scan.pdf")
 if scanpdf:
     check("scanned pdf has no fuzzy", scanpdf["fuzzy"] is None)

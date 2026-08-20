@@ -566,6 +566,7 @@ name = "dupey"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cfb",
  "clap",
  "dupey-core",
  "jiff",

@@ -95,6 +95,110 @@ fn write_hwpx(path: &Path, paragraphs: &[&str], date: &str) {
     zip.finish().unwrap();
 }
 
+fn write_hwp(path: &Path, paras: &[&str]) {
+    let mut section = Vec::new();
+    for p in paras {
+        let mut utf16: Vec<u8> = p.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+        while utf16.len() % 4 != 0 {
+            utf16.extend_from_slice(&0u16.to_le_bytes());
+        }
+        let header: u32 = 67u32 | ((utf16.len() as u32 / 4) << 20);
+        section.extend_from_slice(&header.to_le_bytes());
+        section.extend_from_slice(&utf16);
+    }
+    let mut header = vec![0u8; 256];
+    header[0..32].copy_from_slice(b"HWP Document File\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0");
+    header[32..36].copy_from_slice(&0x00050100u32.to_le_bytes());
+    let file = std::fs::File::create(path).unwrap();
+    let mut ole = cfb::CompoundFile::create(file).unwrap();
+    {
+        let mut s = ole.create_stream("FileHeader").unwrap();
+        s.write_all(&header).unwrap();
+    }
+    ole.create_storage("BodyText").unwrap();
+    {
+        let mut s = ole.create_stream("BodyText/Section0").unwrap();
+        s.write_all(&section).unwrap();
+    }
+}
+
+fn write_pptx(path: &Path, slides: &[&str], modified: &str) {
+    let file = std::fs::File::create(path).unwrap();
+    let mut zip = zip::ZipWriter::new(file);
+    let opts =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    for (i, text) in slides.iter().enumerate() {
+        let slide = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+             <p:sld xmlns:p=\"http://schemas.openxmlformats.org/presentationml/2006/main\" \
+             xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\">\
+             <p:cSld><p:spTree><p:sp><p:txBody>\
+             <a:p><a:r><a:t>{text}</a:t></a:r></a:p>\
+             </p:txBody></p:sp></p:spTree></p:cSld></p:sld>"
+        );
+        zip.start_file(format!("ppt/slides/slide{}.xml", i + 1), opts).unwrap();
+        zip.write_all(slide.as_bytes()).unwrap();
+    }
+    let core = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+         <cp:coreProperties xmlns:cp=\"http://schemas.openxmlformats.org/package/2006/metadata/core-properties\" \
+         xmlns:dcterms=\"http://purl.org/dc/terms/\">\
+         <dcterms:modified xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"dcterms:W3CDTF\">{modified}</dcterms:modified>\
+         </cp:coreProperties>"
+    );
+    zip.start_file("docProps/core.xml", opts).unwrap();
+    zip.write_all(core.as_bytes()).unwrap();
+    zip.finish().unwrap();
+}
+
+fn write_xlsx(path: &Path, strings: &[&str], rows: &[&[usize]], modified: &str) {
+    let sst_items: String = strings
+        .iter()
+        .map(|s| format!("<si><t xml:space=\"preserve\">{s}</t></si>"))
+        .collect();
+    let sst = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+         <sst xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">{sst_items}</sst>"
+    );
+    let rows_xml: String = rows
+        .iter()
+        .enumerate()
+        .map(|(r, row)| {
+            let cells: String = row
+                .iter()
+                .enumerate()
+                .map(|(c, &si)| {
+                    format!("<c r=\"{}{}\" t=\"s\"><v>{si}</v></c>", (b'A' + c as u8) as char, r + 1)
+                })
+                .collect();
+            format!("<row r=\"{}\">{cells}</row>", r + 1)
+        })
+        .collect();
+    let sheet = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+         <worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">\
+         <sheetData>{rows_xml}</sheetData></worksheet>"
+    );
+    let core = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+         <cp:coreProperties xmlns:cp=\"http://schemas.openxmlformats.org/package/2006/metadata/core-properties\" \
+         xmlns:dcterms=\"http://purl.org/dc/terms/\">\
+         <dcterms:modified xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"dcterms:W3CDTF\">{modified}</dcterms:modified>\
+         </cp:coreProperties>"
+    );
+    let file = std::fs::File::create(path).unwrap();
+    let mut zip = zip::ZipWriter::new(file);
+    let opts =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    zip.start_file("xl/sharedStrings.xml", opts).unwrap();
+    zip.write_all(sst.as_bytes()).unwrap();
+    zip.start_file("xl/worksheets/sheet1.xml", opts).unwrap();
+    zip.write_all(sheet.as_bytes()).unwrap();
+    zip.start_file("docProps/core.xml", opts).unwrap();
+    zip.write_all(core.as_bytes()).unwrap();
+    zip.finish().unwrap();
+}
+
 fn write_pdf(path: &Path, lines: &[&str], mod_date: Option<&str>) {
     let mut content = String::from("BT /F1 12 Tf 12 TL 72 720 Td\n");
     for (i, line) in lines.iter().enumerate() {
@@ -180,6 +284,49 @@ fn main() {
     // Same content, newline-only difference => exact equal.
     let crlf = draft.replace('\n', "\r\n");
     std::fs::write(dir.join("계획_초안_crlf.md"), &crlf).unwrap();
+
+    // Family 5: hwp (binary) one-line edit. Enough body for the
+    // 5-gram MinHash to stay above the near threshold.
+    let hwp_v1 = [
+        "하반기 운영 계획",
+        "인력 충원은 개발 1명과 디자인 1명으로 진행한다.",
+        "장비 도입 예산은 800만 원을 배정한다.",
+        "일정은 분기별 검토 회의에서 확정한다.",
+        "보안 점검은 외부 업체에 맡긴다.",
+        "교육 예산은 팀당 50만 원이다.",
+    ];
+    let hwp_v2 = [
+        "하반기 운영 계획",
+        "인력 충원은 개발 2명과 디자인 1명으로 진행한다.",
+        "장비 도입 예산은 800만 원을 배정한다.",
+        "일정은 분기별 검토 회의에서 확정한다.",
+        "보안 점검은 외부 업체에 맡긴다.",
+        "교육 예산은 팀당 50만 원이다.",
+    ];
+    write_hwp(&dir.join("운영계획.hwp"), &hwp_v1);
+    write_hwp(&dir.join("운영계획_최종.hwp"), &hwp_v2);
+
+    // Family 6: pptx identical slides, different internal timestamps.
+    let slides = ["분기 실적 발표", "매출 12억, 전분기 대비 8퍼센트 증가", "다음 분기 목표와 리스크"];
+    write_pptx(&dir.join("발표자료.pptx"), &slides, "2026-08-01T09:00:00Z");
+    write_pptx(&dir.join("발표자료_복사본.pptx"), &slides, "2026-08-02T09:00:00Z");
+
+    // Family 7: xlsx one-cell edit.
+    let strings = [
+        "항목", "금액", "인건비", "1,200", "서버비", "340", "라이선스", "210",
+        "광고비", "480", "비품", "95", "회의비", "60", "1,350",
+        "택배비", "42", "도서구입", "38", "소모품", "27", "통신비", "88",
+        "수수료", "15", "복리후생", "120", "교통비", "76",
+    ];
+    let rows_v1: Vec<&[usize]> = vec![
+        &[0, 1], &[2, 3], &[4, 5], &[6, 7], &[8, 9], &[10, 11], &[12, 13],
+        &[14, 15], &[16, 17], &[18, 19], &[20, 21], &[22, 23], &[24, 25], &[26, 27],
+    ];
+    let mut v2_flat: Vec<Vec<usize>> = rows_v1.iter().map(|r| r.to_vec()).collect();
+    v2_flat[1][1] = 14;
+    let rows_v2: Vec<&[usize]> = v2_flat.iter().map(|r| r.as_slice()).collect();
+    write_xlsx(&dir.join("예산표.xlsx"), &strings, &rows_v1, "2026-08-01T09:00:00Z");
+    write_xlsx(&dir.join("예산표_v2.xlsx"), &strings, &rows_v2, "2026-08-04T09:00:00Z");
 
     // Unrelated doc and a scanned-style PDF (no embedded text).
     std::fs::write(dir.join("메모.txt"), "오늘 점심은 김치찌개다. 산책을 하고 일찍 잔다.").unwrap();

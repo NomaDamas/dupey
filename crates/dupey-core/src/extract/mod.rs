@@ -96,9 +96,6 @@ pub fn extract(path: &Path) -> Result<CanonicalText> {
         Format::Pptx => pptx::extract_pptx(path),
         Format::Xlsx => xlsx::extract_xlsx(path),
         Format::Pdf => pdf::extract_pdf(path),
-        _ => Err(Error::UnsupportedFormat {
-            path: path.to_path_buf(),
-        }),
     }
 }
 

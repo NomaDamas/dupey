@@ -12,16 +12,21 @@
 - **docx extract** — zip + document.xml 단락 텍스트, docProps·rsId 제외, core.xml에서 내부 수정시각·revision
 - **hwpx extract** — Contents/section*.xml 본문 텍스트, content.hpf에서 dc:date
 - **pdf extract** — 임베디드 텍스트만(pdf-extract). 스캔본은 텍스트 없음으로 명시되고 가족 묶기에서 제외
-- **LSH 가족 묶기** — exact 그룹 → near 0.90 → contains. 64×2 밴드 후보 생성 + 정확 검증, contains는 크기/Jaccard 하한 게이트 + merge intersect
+- **LSH 가족 묶기** — exact 그룹 → near 0.90 → contains. 64×2 밴드 후보 + bottom-k(k=64) 스케치 역인덱스 후보(작은 문서의 contains), 크기/Jaccard 하한 게이트 + merge intersect 검증
 - **rank** — 내부 시각(mtime보다 우선), 포함 관계, 파일명 토큰, revision, 약한 길이. 신뢰도와 이유 공개
 - CLI `dupey scan DIR --json` 이 공개 계약
 - live e2e (`scripts/e2e.sh`) + criterion 벤치 + 코퍼스 벤치 (`scripts/bench.sh`)
 
+- **hwp (바이너리) extract** — CFB + FileHeader 플래그 + deflate + HWPTAG_PARA_TEXT(UTF-16LE, 제어 문자 제거)
+- **pptx extract** — 슬라이드 a:t 텍스트(슬라이드 순), 발표자 노트 제외
+- **xlsx extract** — 셀 값(공유 문자열 해석), 행 단위 탭 구분, calcChain 무시
+- **contains 후보 개선** — bottom-k 스케치 (위 가족 묶기에 포함)
+
 ## 다음
 
-1. hwp (바이너리) extract — 한국 사무 공백
-2. pptx / xlsx extract
-3. 대규모 코퍼스에서 contains 후보 생성 개선 (bottom-k 스케치)
+1. hwp summary metadata(\\005HwpSummaryInformation)에서 내부 수정시각 읽기
+2. 대용량 폴더 병렬 extract (병목은 파일 I/O)
+3. xlsx 날짜/숫자 서식 없는 셀의 로캘 안정화
 
 ```text
 scan DIR

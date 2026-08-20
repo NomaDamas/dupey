@@ -6,7 +6,7 @@ Office **document family** detector. Not a generic duplicate-file cleaner.
 
 Semantic embeddings are out of scope. Auto-delete is out of scope.
 
-Status: v1 pipeline works. `txt` / `md` / `docx` / `hwpx` / `pdf` (embedded text) extract, exact + near + contains clustering, and the `scan --json` public contract are live. Legacy binary `hwp` and scanned PDFs are out of the comparable pipeline.
+Status: v1 pipeline works. `txt` / `md` / `docx` / `hwpx` / binary `hwp` / `pptx` / `xlsx` / `pdf` (embedded text) extract, exact + near + contains clustering (LSH + bottom-k sketch candidates), and the `scan --json` public contract are live. Scanned PDFs are out of the comparable pipeline.
 
 ```bash
 dupey scan ./docs --json          # the public contract

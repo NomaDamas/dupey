@@ -18,6 +18,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+cfb = "0.14.0"
 clap.workspace = true
 dupey-core.workspace = true
 jiff = "0.2.35"
