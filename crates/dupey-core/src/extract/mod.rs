@@ -8,7 +8,9 @@ pub mod docx;
 pub mod hwp;
 pub mod hwpx;
 pub mod pdf;
+pub mod pptx;
 pub mod text;
+pub mod xlsx;
 
 use std::path::{Path, PathBuf};
 
@@ -55,6 +57,8 @@ impl Format {
                 | Self::Hwpx
                 | Self::Hwp
                 | Self::Pdf
+                | Self::Pptx
+                | Self::Xlsx
         )
     }
 }
@@ -89,6 +93,8 @@ pub fn extract(path: &Path) -> Result<CanonicalText> {
         Format::Docx => docx::extract_docx(path),
         Format::Hwpx => hwpx::extract_hwpx(path),
         Format::Hwp => hwp::extract_hwp(path),
+        Format::Pptx => pptx::extract_pptx(path),
+        Format::Xlsx => xlsx::extract_xlsx(path),
         Format::Pdf => pdf::extract_pdf(path),
         _ => Err(Error::UnsupportedFormat {
             path: path.to_path_buf(),
@@ -123,7 +129,7 @@ mod tests {
             assert!(f.extract_ready(), "{f:?} should be extract-ready");
         }
         assert!(Format::Hwp.extract_ready());
-        assert!(!Format::Pptx.extract_ready());
-        assert!(!Format::Xlsx.extract_ready());
+        assert!(Format::Pptx.extract_ready());
+        assert!(Format::Xlsx.extract_ready());
     }
 }
