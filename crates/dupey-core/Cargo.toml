@@ -13,6 +13,8 @@ keywords = ["dedup", "minhash", "documents", "near-duplicate"]
 categories = ["text-processing"]
 
 [dependencies]
+cfb = "0.14.0"
+flate2 = "1.1.9"
 gaoya.workspace = true
 hex.workspace = true
 jiff = { version = "0.2.35", features = ["serde"] }

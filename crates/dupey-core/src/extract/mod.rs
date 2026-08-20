@@ -5,6 +5,7 @@
 //! document". Scoring is shared; only extract grows per format.
 
 pub mod docx;
+pub mod hwp;
 pub mod hwpx;
 pub mod pdf;
 pub mod text;
@@ -48,7 +49,12 @@ impl Format {
     pub fn extract_ready(self) -> bool {
         matches!(
             self,
-            Self::Txt | Self::Markdown | Self::Docx | Self::Hwpx | Self::Pdf
+            Self::Txt
+                | Self::Markdown
+                | Self::Docx
+                | Self::Hwpx
+                | Self::Hwp
+                | Self::Pdf
         )
     }
 }
@@ -82,6 +88,7 @@ pub fn extract(path: &Path) -> Result<CanonicalText> {
         Format::Txt | Format::Markdown => text::extract_utf8(path, format),
         Format::Docx => docx::extract_docx(path),
         Format::Hwpx => hwpx::extract_hwpx(path),
+        Format::Hwp => hwp::extract_hwp(path),
         Format::Pdf => pdf::extract_pdf(path),
         _ => Err(Error::UnsupportedFormat {
             path: path.to_path_buf(),
@@ -115,6 +122,8 @@ mod tests {
         ] {
             assert!(f.extract_ready(), "{f:?} should be extract-ready");
         }
-        assert!(!Format::Hwp.extract_ready());
+        assert!(Format::Hwp.extract_ready());
+        assert!(!Format::Pptx.extract_ready());
+        assert!(!Format::Xlsx.extract_ready());
     }
 }
