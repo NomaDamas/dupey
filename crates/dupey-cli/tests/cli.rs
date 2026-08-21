@@ -71,7 +71,8 @@ fn unsupported_cjk_pdf() -> Vec<u8> {
     pdf.into_bytes()
 }
 
-const PROPOSAL: &str = "프로젝트 제안서\n\n1. 배경\n본 제안은 2026년 하반기 사무 자동화 도입을 위한 것이다. \
+const PROPOSAL: &str =
+    "프로젝트 제안서\n\n1. 배경\n본 제안은 2026년 하반기 사무 자동화 도입을 위한 것이다. \
      현재 팀은 문서가 폴더에 흩어져 있고 최신본을 찾기 어렵다.\n\n2. 범위\n문서 수집, \
      중복 정리, 검색, 권한은 1단계 범위에 포함하지 않는다.\n\n3. 일정\n킥오프는 9월 1일, \
      파일럿은 10월 말까지 진행한다.\n\n4. 예산\n예상 비용은 3,200만 원이다.\n";
@@ -125,13 +126,10 @@ fn scan_finds_near_family_and_picks_final() {
     let fam = &families[0];
     assert_eq!(fam["files"].as_array().unwrap().len(), 2);
     assert_eq!(fam["relation"], "near");
-    assert_eq!(
-        fam["pick"]["ranked"][0]["path"]
-            .as_str()
-            .unwrap()
-            .ends_with("제안서_최종.txt"),
-        true
-    );
+    assert!(fam["pick"]["ranked"][0]["path"]
+        .as_str()
+        .unwrap()
+        .ends_with("제안서_최종.txt"));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -139,10 +137,7 @@ fn scan_finds_near_family_and_picks_final() {
 fn scan_exact_duplicate_group() {
     let dir = fixture_dir(
         "exact",
-        &[
-            ("보고서.txt", PROPOSAL),
-            ("보고서 사본.txt", PROPOSAL),
-        ],
+        &[("보고서.txt", PROPOSAL), ("보고서 사본.txt", PROPOSAL)],
     );
     let v = scan_json(&dir);
     let families = v["families"].as_array().unwrap();
@@ -154,11 +149,18 @@ fn scan_exact_duplicate_group() {
 #[test]
 fn fingerprint_and_compare_still_work() {
     let dir = fixture_dir("basic", &[("a.txt", PROPOSAL)]);
-    let out = dupey().args(["fingerprint"]).arg(dir.join("a.txt")).output().unwrap();
+    let out = dupey()
+        .args(["fingerprint"])
+        .arg(dir.join("a.txt"))
+        .output()
+        .unwrap();
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("exact\t"), "{stdout}");
-    assert!(stdout.contains("modified\t"), "fingerprint shows meta: {stdout}");
+    assert!(
+        stdout.contains("modified\t"),
+        "fingerprint shows meta: {stdout}"
+    );
 
     let out = dupey()
         .args(["compare"])

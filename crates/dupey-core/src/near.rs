@@ -90,10 +90,16 @@ pub fn containment_at_least(a: &[u64], b: &[u64], threshold: f64) -> f64 {
 }
 
 fn char_ngrams(text: &str, n: usize) -> impl Iterator<Item = String> + '_ {
-    let normalized: String = whitespace_split(&text.to_lowercase()).collect::<Vec<_>>().join(" ");
+    let normalized: String = whitespace_split(&text.to_lowercase())
+        .collect::<Vec<_>>()
+        .join(" ");
     let chars: Vec<char> = normalized.chars().collect();
     let len = chars.len();
-    let take = if len < n { usize::from(len > 0) } else { len - n + 1 };
+    let take = if len < n {
+        usize::from(len > 0)
+    } else {
+        len - n + 1
+    };
     (0..take).map(move |i| {
         let end = (i + n).min(len);
         chars[i..end].iter().collect()

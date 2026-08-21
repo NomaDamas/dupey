@@ -96,8 +96,8 @@ fn summary_meta(path: &Path, ole: &mut cfb::CompoundFile<std::fs::File>) -> DocM
             return meta;
         }
         let prop_id = u32::from_le_bytes(buf[entry..entry + 4].try_into().unwrap());
-        let value_off =
-            section_off + u32::from_le_bytes(buf[entry + 4..entry + 8].try_into().unwrap()) as usize;
+        let value_off = section_off
+            + u32::from_le_bytes(buf[entry + 4..entry + 8].try_into().unwrap()) as usize;
         if prop_id != 10 || value_off + 12 > buf.len() {
             continue;
         }
@@ -151,8 +151,6 @@ fn inflate(path: &Path, raw: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-const HWPTAG_LIST_HEADER: u16 = 72;
-
 /// Walk section records; collect UTF-16LE text of HWPTAG_PARA_TEXT at
 /// any level (table cells are nested PARA_TEXT), dropping control
 /// placeholders. Table cell boundaries (LIST_HEADER) become tabs so cell
@@ -177,31 +175,28 @@ fn section_text(body: &[u8]) -> String {
         if pos + size > body.len() {
             break;
         }
-        match tag_id {
-            HWPTAG_PARA_TEXT => {
-                if level > 0 {
-                    // Nested paragraph: a table cell's text. Tabs between
-                    // cells instead of the paragraph newline.
-                    if cells_in_row > 0 && out.ends_with('\n') {
-                        out.pop();
-                        out.push('\t');
-                    }
-                    cells_in_row += 1;
-                } else {
-                    cells_in_row = 0;
+        if tag_id == HWPTAG_PARA_TEXT {
+            if level > 0 {
+                // Nested paragraph: a table cell's text. Tabs between
+                // cells instead of the paragraph newline.
+                if cells_in_row > 0 && out.ends_with('\n') {
+                    out.pop();
+                    out.push('\t');
                 }
-                for chunk in body[pos..pos + size].chunks_exact(2) {
-                    let c = u16::from_le_bytes([chunk[0], chunk[1]]);
-                    match c {
-                        // Control placeholders: fields/objects. Only real
-                        // prose characters survive extract.
-                        0x0000..=0x001F | 0xE000..=0xF8FF => {}
-                        _ => out.push(char::from_u32(c as u32).unwrap_or('\u{FFFD}')),
-                    }
-                }
-                out.push('\n');
+                cells_in_row += 1;
+            } else {
+                cells_in_row = 0;
             }
-            _ => {}
+            for chunk in body[pos..pos + size].chunks_exact(2) {
+                let c = u16::from_le_bytes([chunk[0], chunk[1]]);
+                match c {
+                    // Control placeholders: fields/objects. Only real
+                    // prose characters survive extract.
+                    0x0000..=0x001F | 0xE000..=0xF8FF => {}
+                    _ => out.push(char::from_u32(c as u32).unwrap_or('\u{FFFD}')),
+                }
+            }
+            out.push('\n');
         }
         pos += size;
     }
@@ -224,15 +219,11 @@ pub(crate) mod tests {
         for p in paras {
             // HWP record sizes are in dwords; real paragraph records pad
             // text up to a 4-byte boundary.
-            let mut utf16: Vec<u8> = p
-                .encode_utf16()
-                .flat_map(|u| u.to_le_bytes())
-                .collect();
-            while utf16.len() % 4 != 0 {
+            let mut utf16: Vec<u8> = p.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+            while !utf16.len().is_multiple_of(4) {
                 utf16.extend_from_slice(&0u16.to_le_bytes());
             }
-            let header: u32 =
-                BODYTEXT_PARA_TEXT as u32 | (0u32 << 10) | ((utf16.len() as u32 / 4) << 20);
+            let header: u32 = BODYTEXT_PARA_TEXT as u32 | ((utf16.len() as u32 / 4) << 20);
             out.extend_from_slice(&header.to_le_bytes());
             out.extend_from_slice(&utf16);
         }
@@ -291,9 +282,7 @@ pub(crate) mod tests {
             s.write_all(&section).unwrap();
         }
         if let Some(ft) = edittime {
-            let mut s = ole
-                .create_stream("\u{5}HwpSummaryInformation")
-                .unwrap();
+            let mut s = ole.create_stream("\u{5}HwpSummaryInformation").unwrap();
             s.write_all(&property_set(10, ft)).unwrap();
         }
         ole.into_inner().into_inner()
@@ -341,7 +330,7 @@ pub(crate) mod tests {
         let mut out = Vec::new();
         let mut put = |tag: u16, level: u32, text: &str| {
             let mut utf16: Vec<u8> = text.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
-            while utf16.len() % 4 != 0 {
+            while !utf16.len().is_multiple_of(4) {
                 utf16.extend_from_slice(&0u16.to_le_bytes());
             }
             let header: u32 = tag as u32 | (level << 10) | ((utf16.len() as u32 / 4) << 20);
@@ -363,11 +352,8 @@ pub(crate) mod tests {
         let mut header = vec![0u8; 256];
         header[0..32].copy_from_slice(b"HWP Document File\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0");
         header[32..36].copy_from_slice(&0x00050100u32.to_le_bytes());
-        let section = section_stream_with_table(
-            "예산 내역",
-            &["인건비", "1,200", "서버비", "340"],
-            "이상.",
-        );
+        let section =
+            section_stream_with_table("예산 내역", &["인건비", "1,200", "서버비", "340"], "이상.");
         let cursor = std::io::Cursor::new(Vec::new());
         let mut ole = cfb::CompoundFile::create(cursor).unwrap();
         {
@@ -383,7 +369,11 @@ pub(crate) mod tests {
         let got = extract_hwp(&path).unwrap();
         assert!(got.text.contains("예산 내역"), "{:?}", got.text);
         for cell in ["인건비", "1,200", "서버비", "340"] {
-            assert!(got.text.contains(cell), "missing cell {cell:?} in {:?}", got.text);
+            assert!(
+                got.text.contains(cell),
+                "missing cell {cell:?} in {:?}",
+                got.text
+            );
         }
         assert!(got.text.contains("이상."), "{:?}", got.text);
         // Cells are tab-separated like xlsx rows.

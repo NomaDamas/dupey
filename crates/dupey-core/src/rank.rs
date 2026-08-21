@@ -56,7 +56,15 @@ const W_LENGTH: f64 = 0.25;
 
 const POSITIVE_TOKENS: &[&str] = &["최종", "최최종", "찐", "final", "완료", "정본"];
 const NEGATIVE_TOKENS: &[&str] = &[
-    "복사본", "사본", "copy", "old", "draft", "초안", "백업", "backup", "원본",
+    "복사본",
+    "사본",
+    "copy",
+    "old",
+    "draft",
+    "초안",
+    "백업",
+    "backup",
+    "원본",
 ];
 
 /// Rank a family's members as latest-candidate picks with public reasons.
@@ -77,7 +85,8 @@ pub fn rank(family_id: u32, signals: &[MemberSignals]) -> FamilyRanking {
             let mut reasons = Vec::new();
 
             if let Some(t) = m.internal_modified {
-                if internal_times.len() > 1 && internal_times.iter().max() == Some(&t)
+                if internal_times.len() > 1
+                    && internal_times.iter().max() == Some(&t)
                     && internal_times.iter().min() < Some(&t)
                 {
                     score += W_INTERNAL_TIME;
@@ -94,7 +103,8 @@ pub fn rank(family_id: u32, signals: &[MemberSignals]) -> FamilyRanking {
                     .filter(|s| s.internal_modified.is_none())
                     .filter_map(|s| s.fs_mtime)
                     .collect();
-                if fs_times.len() > 1 && fs_times.iter().max() == Some(&t)
+                if fs_times.len() > 1
+                    && fs_times.iter().max() == Some(&t)
                     && fs_times.iter().min() < Some(&t)
                 {
                     score += W_FS_TIME;
@@ -123,7 +133,8 @@ pub fn rank(family_id: u32, signals: &[MemberSignals]) -> FamilyRanking {
             }
 
             if let Some(r) = m.revision {
-                if revisions.len() > 1 && revisions.iter().max() == Some(&r)
+                if revisions.len() > 1
+                    && revisions.iter().max() == Some(&r)
                     && revisions.iter().min() < Some(&r)
                 {
                     score += W_REVISION;
@@ -196,7 +207,7 @@ fn filename_score(
     for t in POSITIVE_TOKENS {
         if name.contains(t) {
             score += W_FILENAME;
-            toks.push(format!("'{t}'(+)") );
+            toks.push(format!("'{t}'(+)"));
         }
     }
     for t in NEGATIVE_TOKENS {
@@ -219,7 +230,7 @@ fn filename_score(
 /// Extract `v3` / `V12` style version numbers from a filename.
 fn version_of(path: &std::path::Path) -> Option<u32> {
     let name = path.file_name()?.to_string_lossy().to_lowercase();
-    let stem = name.rsplit('.').skip(1).next().unwrap_or(&name);
+    let stem = name.rsplit('.').nth(1).unwrap_or(&name);
     let bytes = stem.as_bytes();
     let mut best = None;
     for (i, &b) in bytes.iter().enumerate() {

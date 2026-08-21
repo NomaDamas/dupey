@@ -55,11 +55,7 @@ fn extract_err(path: &Path, e: impl std::fmt::Display) -> Error {
     }
 }
 
-fn read_entry(
-    path: &Path,
-    zip: &mut zip::ZipArchive<std::fs::File>,
-    name: &str,
-) -> Result<String> {
+fn read_entry(path: &Path, zip: &mut zip::ZipArchive<std::fs::File>, name: &str) -> Result<String> {
     let mut entry = zip.by_name(name).map_err(|e| extract_err(path, e))?;
     let mut buf = String::new();
     entry
@@ -165,7 +161,8 @@ pub(crate) mod tests {
             );
             zip.start_file("docProps/core.xml", opts).unwrap();
             zip.write_all(core.as_bytes()).unwrap();
-            zip.start_file("ppt/notesSlides/notesSlide1.xml", opts).unwrap();
+            zip.start_file("ppt/notesSlides/notesSlide1.xml", opts)
+                .unwrap();
             let notes = "<p:notes xmlns:p=\"x\" xmlns:a=\"y\"><p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>노트는 본문이 아니다</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:notes>";
             zip.write_all(notes.as_bytes()).unwrap();
             zip.finish().unwrap();
@@ -182,7 +179,10 @@ pub(crate) mod tests {
         let path = write_tmp("dupey-pptx-text.pptx", &bytes);
         let got = extract_pptx(&path).unwrap();
         assert_eq!(got.format, Format::Pptx);
-        assert_eq!(got.text, "1분기 실적\n매출 12억, 전분기 대비 8% 증가\n2분기 목표\n");
+        assert_eq!(
+            got.text,
+            "1분기 실적\n매출 12억, 전분기 대비 8% 증가\n2분기 목표\n"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -192,7 +192,10 @@ pub(crate) mod tests {
         let path = write_tmp("dupey-pptx-meta.pptx", &bytes);
         let got = extract_pptx(&path).unwrap();
         assert!(!got.text.contains("노트"), "notes are not body text");
-        assert_eq!(got.meta.modified.unwrap().to_string(), "2026-08-02T10:00:00Z");
+        assert_eq!(
+            got.meta.modified.unwrap().to_string(),
+            "2026-08-02T10:00:00Z"
+        );
         let _ = std::fs::remove_file(&path);
     }
 }
