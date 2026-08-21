@@ -33,6 +33,44 @@ fn scan_json(dir: &Path) -> serde_json::Value {
     serde_json::from_slice(&out.stdout).unwrap()
 }
 
+fn unsupported_cjk_pdf() -> Vec<u8> {
+    let content = "BT /F1 12 Tf 72 720 Td <0041> Tj ET\n";
+    let objects = [
+        "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+         /Resources << /Font << /F1 4 0 R >> >> /Contents 6 0 R >>"
+            .to_string(),
+        "<< /Type /Font /Subtype /Type0 /BaseFont /TestKorean \
+         /Encoding /UniKS-UCS2-H /DescendantFonts [5 0 R] >>"
+            .to_string(),
+        "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /TestKorean \
+         /CIDSystemInfo << /Registry (Adobe) /Ordering (Korea1) /Supplement 1 >> \
+         /DW 1000 >>"
+            .to_string(),
+        format!(
+            "<< /Length {} >>\nstream\n{content}endstream",
+            content.len()
+        ),
+    ];
+    let mut pdf = String::from("%PDF-1.4\n");
+    let mut offsets = Vec::new();
+    for (i, body) in objects.iter().enumerate() {
+        offsets.push(pdf.len());
+        pdf.push_str(&format!("{} 0 obj\n{}\nendobj\n", i + 1, body));
+    }
+    let xref_at = pdf.len();
+    let n = objects.len() + 1;
+    pdf.push_str(&format!("xref\n0 {n}\n0000000000 65535 f \n"));
+    for off in offsets {
+        pdf.push_str(&format!("{off:010} 00000 n \n"));
+    }
+    pdf.push_str(&format!(
+        "trailer\n<< /Size {n} /Root 1 0 R >>\nstartxref\n{xref_at}\n%%EOF\n"
+    ));
+    pdf.into_bytes()
+}
+
 const PROPOSAL: &str = "프로젝트 제안서\n\n1. 배경\n본 제안은 2026년 하반기 사무 자동화 도입을 위한 것이다. \
      현재 팀은 문서가 폴더에 흩어져 있고 최신본을 찾기 어렵다.\n\n2. 범위\n문서 수집, \
      중복 정리, 검색, 권한은 1단계 범위에 포함하지 않는다.\n\n3. 일정\n킥오프는 9월 1일, \
@@ -130,5 +168,32 @@ fn fingerprint_and_compare_still_work() {
         .unwrap();
     assert!(out.status.success());
     assert!(String::from_utf8_lossy(&out.stdout).contains("exact_equal\ttrue"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn scan_continues_after_problem_pdf() {
+    let dir = fixture_dir("pdf-error", &[("kept.txt", PROPOSAL)]);
+    std::fs::write(dir.join("unsupported-korean.pdf"), unsupported_cjk_pdf()).unwrap();
+    std::fs::write(dir.join("broken.pdf"), b"%PDF-1.4\nnot a document").unwrap();
+
+    let v = scan_json(&dir);
+    assert!(
+        v["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|file| file["path"].as_str().unwrap().ends_with("kept.txt")),
+        "successful files must still be emitted: {v}"
+    );
+    assert_eq!(v["files"].as_array().unwrap().len(), 2, "{v}");
+    assert_eq!(v["errors"].as_array().unwrap().len(), 1, "{v}");
+    assert!(
+        v["errors"][0]["path"]
+            .as_str()
+            .unwrap()
+            .ends_with("broken.pdf"),
+        "the malformed PDF must be isolated in errors[]: {v}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
