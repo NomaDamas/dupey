@@ -11,6 +11,8 @@ pub const CHAR_NGRAM: usize = 5;
 
 /// Default Jaccard threshold for treating two docs as one family.
 pub const DEFAULT_NEAR_THRESHOLD: f64 = 0.90;
+/// MinHash estimate required before paying for exact shingle Jaccard.
+pub const MINHASH_CANDIDATE_THRESHOLD: f64 = 0.80;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NearSignature {
@@ -52,6 +54,31 @@ pub fn shingles(text: &str) -> Vec<u64> {
     v.sort_unstable();
     v.dedup();
     v
+}
+
+/// Exact Jaccard similarity for sorted, deduplicated shingle hashes.
+pub fn exact_jaccard(a: &[u64], b: &[u64]) -> f64 {
+    if a.is_empty() && b.is_empty() {
+        return 1.0;
+    }
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+    let mut shared = 0usize;
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => {
+                shared += 1;
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    let union = a.len() + b.len() - shared;
+    shared as f64 / union as f64
 }
 
 /// |A ∩ B| / |B|: how much of B lives inside A.
@@ -153,5 +180,12 @@ mod tests {
         let b = "오늘 점심은 김치찌개다. 오후에는 운동을 하고 책을 읽는다.";
         let s = score(&near_sig(&a), &near_sig(b));
         assert!(s < 0.3, "expected unrelated score, got {s}");
+    }
+
+    #[test]
+    fn exact_jaccard_is_computed_from_complete_shingle_sets() {
+        assert!((exact_jaccard(&[1, 2, 3, 4], &[1, 2, 3, 5]) - 0.6).abs() < 1e-9);
+        assert_eq!(exact_jaccard(&[], &[]), 1.0);
+        assert_eq!(exact_jaccard(&[1], &[]), 0.0);
     }
 }
