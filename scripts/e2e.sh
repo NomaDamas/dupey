@@ -9,6 +9,11 @@ CORPUS="${1:-target/e2e-corpus}"
 cargo build --release -q
 cargo run --release -q -p dupey --example mkfixtures -- "$CORPUS" 1
 
+# Vendor/VCS trees must not be descended into (issue #5).
+mkdir -p "$CORPUS/node_modules/pkg" "$CORPUS/.git"
+printf '%s\n' 'MIT License dummy from vendor' > "$CORPUS/node_modules/pkg/LICENSE.md"
+printf '%s\n' 'should not be scanned' > "$CORPUS/.git/README.md"
+
 ./target/release/dupey scan "$CORPUS" --json > target/e2e-scan.json
 
 python3 - "$CORPUS" <<'PY'
@@ -113,6 +118,12 @@ if scanpdf:
 else:
     err = any(e["path"].endswith("scan.pdf") for e in out["errors"])
     check("scanned pdf surfaces as error", err)
+
+# 13. vendor/VCS trees are not descended into
+all_paths = [f["path"].replace("\\", "/") for f in out["files"]]
+all_paths += [e["path"].replace("\\", "/") for e in out["errors"]]
+check("skips node_modules", all(p.find("/node_modules/") < 0 for p in all_paths))
+check("skips .git", all(p.find("/.git/") < 0 for p in all_paths))
 
 if fails:
     print(f"\n{len(fails)} check(s) failed")

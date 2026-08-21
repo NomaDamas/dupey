@@ -1,10 +1,12 @@
+mod skip;
+
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use dupey_core::{
-    cluster, exact_hash_hex, extract, near_sig, rank, CanonicalText, Format, MemberSignals,
-    ScannedDoc, DEFAULT_NEAR_THRESHOLD,
+    cluster, containment, exact_hash_hex, extract, near_sig, rank, CanonicalText, Format,
+    MemberSignals, ScannedDoc, DEFAULT_NEAR_THRESHOLD,
 };
 use serde::Serialize;
 
@@ -31,9 +33,13 @@ enum Command {
         /// Emit the public JSON contract instead of a human summary
         #[arg(long)]
         json: bool,
-        /// Family threshold for near/contains (Jaccard estimate)
+        /// Exact shingle Jaccard threshold for near/contains
         #[arg(long, default_value_t = DEFAULT_NEAR_THRESHOLD)]
         threshold: f64,
+        /// Extra directory names to skip (folder name, not a path). Repeatable.
+        /// Merged with builtins: node_modules, .git, target, dist, build, ...
+        #[arg(long = "exclude-dir", value_name = "NAME", action = clap::ArgAction::Append)]
+        exclude_dir: Vec<String>,
     },
 }
 
@@ -45,7 +51,8 @@ fn main() -> Result<()> {
             dir,
             json,
             threshold,
-        } => scan(&dir, json, threshold),
+            exclude_dir,
+        } => scan(&dir, json, threshold, &exclude_dir),
     }
 }
 
@@ -73,11 +80,19 @@ fn compare(a: &Path, b: &Path) -> Result<()> {
     let cb = extract(b).with_context(|| format!("extract {}", b.display()))?;
     let ha = exact_hash_hex(&ca.text);
     let hb = exact_hash_hex(&cb.text);
+    let sa = dupey_core::shingles(&ca.text);
+    let sb = dupey_core::shingles(&cb.text);
     let near = dupey_core::score(&near_sig(&ca.text), &near_sig(&cb.text));
+    let jaccard = dupey_core::exact_jaccard(&sa, &sb);
+    let a_in_b = containment(&sb, &sa);
+    let b_in_a = containment(&sa, &sb);
     println!("a\t{}", a.display());
     println!("b\t{}", b.display());
     println!("exact_equal\t{}", ha == hb);
     println!("near_score\t{near:.4}");
+    println!("jaccard\t{jaccard:.4}");
+    println!("containment_a_in_b\t{a_in_b:.4}");
+    println!("containment_b_in_a\t{b_in_a:.4}");
     Ok(())
 }
 
@@ -132,16 +147,20 @@ struct ScanOut {
     errors: Vec<ErrorEntry>,
 }
 
-fn scan(dir: &Path, json: bool, threshold: f64) -> Result<()> {
+fn scan(dir: &Path, json: bool, threshold: f64, extra_exclude: &[String]) -> Result<()> {
     let t0 = std::time::Instant::now();
     let mut files: Vec<FileEntry> = Vec::new();
     let mut docs: Vec<ScannedDoc> = Vec::new();
     let mut metas: Vec<(CanonicalText, Option<jiff::Timestamp>)> = Vec::new();
     let mut errors: Vec<ErrorEntry> = Vec::new();
 
+    let skip = skip::skip_set(extra_exclude);
     let mut paths: Vec<PathBuf> = Vec::new();
     for entry in walkdir::WalkDir::new(dir)
         .into_iter()
+        .filter_entry(|e| {
+            !skip::should_skip_dir(e.file_name(), e.file_type().is_dir(), e.depth(), &skip)
+        })
         .filter_map(|e| e.ok())
     {
         if entry.file_type().is_file() && Format::from_path(entry.path()).is_some() {

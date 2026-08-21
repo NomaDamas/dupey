@@ -18,12 +18,28 @@ const HWPTAG_PARA_TEXT: u16 = 67;
 const FLAG_COMPRESSED: u32 = 1;
 
 pub(crate) fn extract_hwp(path: &Path) -> Result<CanonicalText> {
+    let bytes = std::fs::read(path).map_err(|source| Error::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if let Ok(document) = rhwp::parser::parse_document(&bytes) {
+        let meta = cfb::CompoundFile::open(std::io::Cursor::new(&bytes))
+            .ok()
+            .map(|mut ole| summary_meta(path, &mut ole))
+            .unwrap_or_default();
+        return Ok(CanonicalText {
+            path: path.to_path_buf(),
+            format: Format::Hwp,
+            text: rhwp_text(&document),
+            meta,
+        });
+    }
+
     let file = std::fs::File::open(path).map_err(|source| Error::Io {
         path: path.to_path_buf(),
         source,
     })?;
     let mut ole = cfb::CompoundFile::open(file).map_err(|e| extract_err(path, e))?;
-
     let header = read_stream(path, &mut ole, "/FileHeader")?;
     if header.len() < 40 || &header[0..17] != b"HWP Document File" {
         return Err(extract_err(path, "not a HWP 5.x document"));
@@ -51,7 +67,7 @@ pub(crate) fn extract_hwp(path: &Path) -> Result<CanonicalText> {
     for name in &sections {
         let raw = read_stream(path, &mut ole, name)?;
         let body = if flags & FLAG_COMPRESSED != 0 {
-            inflate(path, &raw)?
+            inflate_raw(path, &raw)?
         } else {
             raw
         };
@@ -68,9 +84,51 @@ pub(crate) fn extract_hwp(path: &Path) -> Result<CanonicalText> {
     })
 }
 
+fn rhwp_text(document: &rhwp::model::document::Document) -> String {
+    let mut out = String::new();
+    for section in &document.sections {
+        for paragraph in &section.paragraphs {
+            push_rhwp_paragraph(&mut out, paragraph);
+        }
+    }
+    out
+}
+
+fn push_rhwp_paragraph(out: &mut String, paragraph: &rhwp::model::paragraph::Paragraph) {
+    let text = paragraph
+        .text
+        .chars()
+        .filter(|c| !c.is_control() || matches!(c, '\t' | '\n'))
+        .collect::<String>();
+    if !text.is_empty() {
+        out.push_str(&text);
+        out.push('\n');
+    }
+
+    for control in &paragraph.controls {
+        if let rhwp::model::control::Control::Table(table) = control {
+            let mut cells = table.cells.iter().collect::<Vec<_>>();
+            cells.sort_by_key(|cell| (cell.row, cell.col));
+            let mut row = None;
+            for cell in cells {
+                if row == Some(cell.row) {
+                    if out.ends_with('\n') {
+                        out.pop();
+                    }
+                    out.push('\t');
+                }
+                row = Some(cell.row);
+                for cell_paragraph in &cell.paragraphs {
+                    push_rhwp_paragraph(out, cell_paragraph);
+                }
+            }
+        }
+    }
+}
+
 /// \005HwpSummaryInformation: OLE property set. We read PIDSI_EDITTIME
 /// (10, VT_FILETIME) as the internal modified-time signal.
-fn summary_meta(path: &Path, ole: &mut cfb::CompoundFile<std::fs::File>) -> DocMeta {
+fn summary_meta<F: Read + std::io::Seek>(path: &Path, ole: &mut cfb::CompoundFile<F>) -> DocMeta {
     let mut meta = DocMeta::default();
     let Ok(mut stream) = ole.open_stream("/\u{5}HwpSummaryInformation") else {
         return meta;
@@ -96,8 +154,8 @@ fn summary_meta(path: &Path, ole: &mut cfb::CompoundFile<std::fs::File>) -> DocM
             return meta;
         }
         let prop_id = u32::from_le_bytes(buf[entry..entry + 4].try_into().unwrap());
-        let value_off =
-            section_off + u32::from_le_bytes(buf[entry + 4..entry + 8].try_into().unwrap()) as usize;
+        let value_off = section_off
+            + u32::from_le_bytes(buf[entry + 4..entry + 8].try_into().unwrap()) as usize;
         if prop_id != 10 || value_off + 12 > buf.len() {
             continue;
         }
@@ -143,15 +201,13 @@ fn read_stream(
     Ok(buf)
 }
 
-fn inflate(path: &Path, raw: &[u8]) -> Result<Vec<u8>> {
+fn inflate_raw(path: &Path, raw: &[u8]) -> Result<Vec<u8>> {
     let mut out = Vec::new();
-    flate2::read::ZlibDecoder::new(raw)
+    flate2::read::DeflateDecoder::new(raw)
         .read_to_end(&mut out)
         .map_err(|e| extract_err(path, format!("deflate: {e}")))?;
     Ok(out)
 }
-
-const HWPTAG_LIST_HEADER: u16 = 72;
 
 /// Walk section records; collect UTF-16LE text of HWPTAG_PARA_TEXT at
 /// any level (table cells are nested PARA_TEXT), dropping control
@@ -224,10 +280,7 @@ pub(crate) mod tests {
         for p in paras {
             // HWP record sizes are in dwords; real paragraph records pad
             // text up to a 4-byte boundary.
-            let mut utf16: Vec<u8> = p
-                .encode_utf16()
-                .flat_map(|u| u.to_le_bytes())
-                .collect();
+            let mut utf16: Vec<u8> = p.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
             while utf16.len() % 4 != 0 {
                 utf16.extend_from_slice(&0u16.to_le_bytes());
             }
@@ -273,6 +326,32 @@ pub(crate) mod tests {
         make_hwp_with_summary(paras, None)
     }
 
+    fn make_compressed_hwp(paras: &[&str]) -> Vec<u8> {
+        let section = section_stream(paras);
+        let mut compressed = Vec::new();
+        let mut encoder =
+            flate2::write::DeflateEncoder::new(&mut compressed, flate2::Compression::default());
+        encoder.write_all(&section).unwrap();
+        encoder.finish().unwrap();
+
+        let mut header = vec![0u8; 256];
+        header[0..32].copy_from_slice(b"HWP Document File\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0");
+        header[32..36].copy_from_slice(&0x00050100u32.to_le_bytes());
+        header[36..40].copy_from_slice(&FLAG_COMPRESSED.to_le_bytes());
+        let cursor = std::io::Cursor::new(Vec::new());
+        let mut ole = cfb::CompoundFile::create(cursor).unwrap();
+        {
+            let mut s = ole.create_stream("FileHeader").unwrap();
+            s.write_all(&header).unwrap();
+        }
+        ole.create_storage("BodyText").unwrap();
+        {
+            let mut s = ole.create_stream("BodyText/Section0").unwrap();
+            s.write_all(&compressed).unwrap();
+        }
+        ole.into_inner().into_inner()
+    }
+
     pub(crate) fn make_hwp_with_summary(paras: &[&str], edittime: Option<u64>) -> Vec<u8> {
         let section = section_stream(paras);
         let mut header = vec![0u8; 256];
@@ -291,9 +370,7 @@ pub(crate) mod tests {
             s.write_all(&section).unwrap();
         }
         if let Some(ft) = edittime {
-            let mut s = ole
-                .create_stream("\u{5}HwpSummaryInformation")
-                .unwrap();
+            let mut s = ole.create_stream("\u{5}HwpSummaryInformation").unwrap();
             s.write_all(&property_set(10, ft)).unwrap();
         }
         ole.into_inner().into_inner()
@@ -308,6 +385,19 @@ pub(crate) mod tests {
         assert_eq!(
             got.text,
             "사업 계획서\n예산은 3,200만 원이다.\n일정은 9월 시작.\n"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn extracts_raw_deflate_compressed_paragraph_text() {
+        let bytes =
+            make_compressed_hwp(&["압축 사업 계획서", "실제 HWP 5.x는 raw deflate를 사용한다."]);
+        let path = write_tmp("dupey-hwp-compressed.hwp", &bytes);
+        let got = extract_hwp(&path).unwrap();
+        assert_eq!(
+            got.text,
+            "압축 사업 계획서\n실제 HWP 5.x는 raw deflate를 사용한다.\n"
         );
         let _ = std::fs::remove_file(&path);
     }
@@ -363,11 +453,8 @@ pub(crate) mod tests {
         let mut header = vec![0u8; 256];
         header[0..32].copy_from_slice(b"HWP Document File\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0");
         header[32..36].copy_from_slice(&0x00050100u32.to_le_bytes());
-        let section = section_stream_with_table(
-            "예산 내역",
-            &["인건비", "1,200", "서버비", "340"],
-            "이상.",
-        );
+        let section =
+            section_stream_with_table("예산 내역", &["인건비", "1,200", "서버비", "340"], "이상.");
         let cursor = std::io::Cursor::new(Vec::new());
         let mut ole = cfb::CompoundFile::create(cursor).unwrap();
         {
@@ -383,7 +470,11 @@ pub(crate) mod tests {
         let got = extract_hwp(&path).unwrap();
         assert!(got.text.contains("예산 내역"), "{:?}", got.text);
         for cell in ["인건비", "1,200", "서버비", "340"] {
-            assert!(got.text.contains(cell), "missing cell {cell:?} in {:?}", got.text);
+            assert!(
+                got.text.contains(cell),
+                "missing cell {cell:?} in {:?}",
+                got.text
+            );
         }
         assert!(got.text.contains("이상."), "{:?}", got.text);
         // Cells are tab-separated like xlsx rows.
