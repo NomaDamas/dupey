@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use dupey_core::{
-    cluster, containment, exact_hash_hex, extract, near_sig, rank, CanonicalText,
-    Format, MemberSignals, ScannedDoc, DEFAULT_NEAR_THRESHOLD,
+    cluster, containment, exact_hash_hex, extract, near_sig, rank, CanonicalText, Format,
+    MemberSignals, ScannedDoc, DEFAULT_NEAR_THRESHOLD,
 };
 use serde::Serialize;
 
@@ -31,7 +31,7 @@ enum Command {
         /// Emit the public JSON contract instead of a human summary
         #[arg(long)]
         json: bool,
-        /// Family threshold for near/contains (Jaccard estimate)
+        /// Exact shingle Jaccard threshold for near/contains
         #[arg(long, default_value_t = DEFAULT_NEAR_THRESHOLD)]
         threshold: f64,
     },
@@ -73,11 +73,19 @@ fn compare(a: &Path, b: &Path) -> Result<()> {
     let cb = extract(b).with_context(|| format!("extract {}", b.display()))?;
     let ha = exact_hash_hex(&ca.text);
     let hb = exact_hash_hex(&cb.text);
+    let sa = dupey_core::shingles(&ca.text);
+    let sb = dupey_core::shingles(&cb.text);
     let near = dupey_core::score(&near_sig(&ca.text), &near_sig(&cb.text));
+    let jaccard = dupey_core::exact_jaccard(&sa, &sb);
+    let a_in_b = containment(&sb, &sa);
+    let b_in_a = containment(&sa, &sb);
     println!("a\t{}", a.display());
     println!("b\t{}", b.display());
     println!("exact_equal\t{}", ha == hb);
     println!("near_score\t{near:.4}");
+    println!("jaccard\t{jaccard:.4}");
+    println!("containment_a_in_b\t{a_in_b:.4}");
+    println!("containment_b_in_a\t{b_in_a:.4}");
     Ok(())
 }
 
