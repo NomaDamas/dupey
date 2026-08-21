@@ -1,26 +1,67 @@
-//! pdf extraction: embedded text only, via pdf-extract (pure Rust).
+//! pdf extraction: embedded text only, via pdf_oxide (pure Rust).
 //!
 //! Creation metadata (Producer, Creator, CreationDate) is dropped.
 //! /ModDate is kept as internal provenance. Scanned PDFs yield empty
 //! text: they cannot take this pipeline and callers must treat them as
 //! having no comparable content.
 
+use std::any::Any;
 use std::path::Path;
 
 use super::{normalize_newlines, CanonicalText, DocMeta, Format};
 use crate::error::{Error, Result};
+use pdf_oxide::PdfDocument;
 
 pub(crate) fn extract_pdf(path: &Path) -> Result<CanonicalText> {
-    let text = pdf_extract::extract_text(path).map_err(|e| Error::Extract {
-        path: path.to_path_buf(),
-        message: e.to_string(),
-    })?;
+    let extraction = std::panic::catch_unwind(|| extract_document_text(path));
+    let text = match extraction {
+        Ok(Ok(text)) => text,
+        Ok(Err(message)) => {
+            return Err(Error::Extract {
+                path: path.to_path_buf(),
+                message,
+            });
+        }
+        Err(payload) => {
+            return Err(Error::Extract {
+                path: path.to_path_buf(),
+                message: format!("PDF extractor panicked: {}", panic_message(&*payload)),
+            });
+        }
+    };
     Ok(CanonicalText {
         path: path.to_path_buf(),
         format: Format::Pdf,
         text: normalize_newlines(&text),
         meta: pdf_meta(path),
     })
+}
+
+fn extract_document_text(path: &Path) -> std::result::Result<String, String> {
+    let document = PdfDocument::open(path).map_err(|error| error.to_string())?;
+    if document.is_encrypted() && !document.is_authenticated() {
+        return Err("encrypted PDF requires a valid password".to_string());
+    }
+    let page_count = document.page_count().map_err(|error| error.to_string())?;
+    let mut text = String::new();
+    for page in 0..page_count {
+        if page > 0 {
+            text.push('\x0c');
+        }
+        let page_text = document
+            .extract_text(page)
+            .map_err(|error| format!("page {}: {error}", page + 1))?;
+        text.push_str(&page_text);
+    }
+    Ok(text)
+}
+
+fn panic_message(payload: &(dyn Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("unknown panic")
 }
 
 /// /ModDate from the Info dictionary, parsed into a Timestamp.
@@ -110,7 +151,10 @@ mod tests {
              /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>"
                 .to_string(),
             "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string(),
-            format!("<< /Length {} >>\nstream\n{content}endstream", content.len()),
+            format!(
+                "<< /Length {} >>\nstream\n{content}endstream",
+                content.len()
+            ),
             info,
         ];
 
@@ -135,14 +179,26 @@ mod tests {
     #[test]
     fn extracts_embedded_text() {
         let bytes = make_pdf(
-            &["Project proposal", "Budget is 3200 won", "Kickoff in September"],
+            &[
+                "Project proposal",
+                "Budget is 3200 won",
+                "Kickoff in September",
+            ],
             Some("D:20260801090000Z"),
         );
         let path = write_tmp("dupey-pdf-text.pdf", &bytes);
         let got = extract_pdf(&path).unwrap();
         assert_eq!(got.format, Format::Pdf);
-        for line in ["Project proposal", "Budget is 3200 won", "Kickoff in September"] {
-            assert!(got.text.contains(line), "missing {line:?} in {:?}", got.text);
+        for line in [
+            "Project proposal",
+            "Budget is 3200 won",
+            "Kickoff in September",
+        ] {
+            assert!(
+                got.text.contains(line),
+                "missing {line:?} in {:?}",
+                got.text
+            );
         }
         let _ = std::fs::remove_file(&path);
     }
@@ -171,5 +227,69 @@ mod tests {
         assert_eq!(crate::exact_hash(&ta.text), crate::exact_hash(&tb.text));
         let _ = std::fs::remove_file(&pa);
         let _ = std::fs::remove_file(&pb);
+    }
+
+    #[test]
+    fn unsupported_cjk_encoding_never_panics() {
+        let bytes = make_unsupported_cjk_pdf();
+        let path = write_tmp("dupey-pdf-uniks.pdf", &bytes);
+        let result = std::panic::catch_unwind(|| extract_pdf(&path));
+        assert!(
+            result.is_ok(),
+            "PDF extraction must return Result, not panic"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn malformed_pdf_returns_extract_error() {
+        let path = write_tmp("dupey-pdf-malformed.pdf", b"%PDF-1.4\nnot a document");
+        let result = extract_pdf(&path);
+        assert!(
+            matches!(result, Err(Error::Extract { .. })),
+            "malformed PDF must be reported as an extraction error: {result:?}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Minimal Type0/CID font PDF that makes pdf-extract 0.12 panic with
+    /// `unsupported encoding UniKS-UCS2-H`.
+    fn make_unsupported_cjk_pdf() -> Vec<u8> {
+        let content = "BT /F1 12 Tf 72 720 Td <0041> Tj ET\n";
+        let objects = [
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+             /Resources << /Font << /F1 4 0 R >> >> /Contents 6 0 R >>"
+                .to_string(),
+            "<< /Type /Font /Subtype /Type0 /BaseFont /TestKorean \
+             /Encoding /UniKS-UCS2-H /DescendantFonts [5 0 R] >>"
+                .to_string(),
+            "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /TestKorean \
+             /CIDSystemInfo << /Registry (Adobe) /Ordering (Korea1) /Supplement 1 >> \
+             /DW 1000 >>"
+                .to_string(),
+            format!(
+                "<< /Length {} >>\nstream\n{content}endstream",
+                content.len()
+            ),
+        ];
+
+        let mut pdf = String::from("%PDF-1.4\n");
+        let mut offsets = Vec::new();
+        for (i, body) in objects.iter().enumerate() {
+            offsets.push(pdf.len());
+            pdf.push_str(&format!("{} 0 obj\n{}\nendobj\n", i + 1, body));
+        }
+        let xref_at = pdf.len();
+        let n = objects.len() + 1;
+        pdf.push_str(&format!("xref\n0 {n}\n0000000000 65535 f \n"));
+        for off in offsets {
+            pdf.push_str(&format!("{off:010} 00000 n \n"));
+        }
+        pdf.push_str(&format!(
+            "trailer\n<< /Size {n} /Root 1 0 R >>\nstartxref\n{xref_at}\n%%EOF\n"
+        ));
+        pdf.into_bytes()
     }
 }
