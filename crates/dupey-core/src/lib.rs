@@ -15,7 +15,7 @@ pub use exact::{exact_hash, exact_hash_hex};
 pub use extract::{extract, CanonicalText, DocMeta, Format};
 pub use family::{cluster, Family, FamilyMember, Relation, ScannedDoc};
 pub use near::{
-    containment, containment_at_least, near_sig, score, shingles, NearSignature,
-    DEFAULT_NEAR_THRESHOLD, NUM_PERM,
+    containment, containment_at_least, exact_jaccard, near_sig, score, shingles, NearSignature,
+    DEFAULT_NEAR_THRESHOLD, MINHASH_CANDIDATE_THRESHOLD, NUM_PERM,
 };
 pub use rank::{rank, FamilyRanking, MemberSignals, RankSignal, RankedMember};
