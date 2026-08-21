@@ -13,7 +13,7 @@
 - **hwpx extract** — Contents/section*.xml 본문 텍스트, content.hpf에서 dc:date
 - **pdf extract** — 임베디드 텍스트만(pdf-extract). 스캔본은 텍스트 없음으로 명시되고 가족 묶기에서 제외
 - **LSH 가족 묶기** — exact 그룹 → near 0.90 → contains. 64×2 밴드 후보 + bottom-k(k=64) 스케치 역인덱스 후보(작은 문서의 contains), 크기/Jaccard 하한 게이트 + merge intersect 검증
-- **rank** — 내부 시각(mtime보다 우선), 포함 관계, 파일명 토큰, revision, 약한 길이. 신뢰도와 이유 공개
+- **rank** — 수정 시각만 (내부 시각이 있으면 그것, 없으면 fs mtime). 파일명/포함/revision/길이는 점수에 넣지 않음
 - CLI `dupey scan DIR --json` 이 공개 계약
 - live e2e (`scripts/e2e.sh`) + criterion 벤치 + 코퍼스 벤치 (`scripts/bench.sh`)
 
