@@ -1,14 +1,15 @@
 //! Cluster documents into families (exact / near / contains).
 //!
 //! exact groups by SHA-256 of canonical text, near uses LSH over MinHash
-//! signatures at the family threshold (default 0.90), contains uses
+//! candidates and exact shingle Jaccard at the family threshold (default 0.90), contains uses
 //! shingle containment for the draft-inside-final case. Documents with no
 //! comparable text (e.g. scanned PDFs) never cluster.
 
 use std::path::PathBuf;
 
 use crate::near::{
-    containment, containment_at_least, near_sig, score, shingles, NearSignature,
+    containment, containment_at_least, exact_jaccard, near_sig, score, shingles, NearSignature,
+    MINHASH_CANDIDATE_THRESHOLD,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -26,6 +27,8 @@ pub struct FamilyMember {
     pub relation: Relation,
     /// MinHash Jaccard estimate against the family anchor.
     pub near_score: Option<f64>,
+    /// Exact shingle Jaccard against the family anchor, when computed.
+    pub jaccard: Option<f64>,
     /// Shingle containment against the family anchor, when computed.
     pub containment: Option<f64>,
 }
@@ -73,25 +76,21 @@ impl ScannedDoc {
 
 /// Group comparable documents into families of 2+ members.
 ///
-/// LSH runs at a loose candidate threshold (0.5) and every candidate pair
-/// is verified with the exact MinHash estimate, so LSH approximation can
-/// only cost recall, never precision. Contains candidates need the loose
+/// LSH runs at a loose MinHash candidate threshold (0.8), then near pairs
+/// are verified with exact shingle Jaccard. Contains candidates need the
 /// threshold: a draft inside a final can sit at Jaccard 0.5-0.7.
 pub fn cluster(docs: &[ScannedDoc], threshold: f64) -> Vec<Family> {
-    // gaoya requires bands x width == signature length (128). 32x4
-    // keeps template pairs (~0.8 Jaccard) from flooding candidates;
-    // containment recall is covered by the bottom-k sketch index, so
-    // LSH only needs to be reliable at the near threshold.
-    const LSH_BANDS: usize = 32;
-    const LSH_BAND_WIDTH: usize = 4;
-    const LSH_CANDIDATE_THRESHOLD: f64 = 0.5;
-
+    let candidate_threshold = MINHASH_CANDIDATE_THRESHOLD.min(threshold);
+    // gaoya requires bands x width == signature length (128). 16x8
+    // retrieves a MinHash-0.8 pair with ~94.7% probability while
+    // suppressing the much larger population below the candidate gate.
+    const LSH_BANDS: usize = 16;
+    const LSH_BAND_WIDTH: usize = 8;
     let comp: Vec<usize> = (0..docs.len()).filter(|&i| docs[i].comparable()).collect();
     let mut uf = UnionFind::new(docs.len());
 
     // exact: same canonical SHA-256.
-    let mut by_hash: std::collections::HashMap<&str, Vec<usize>> =
-        std::collections::HashMap::new();
+    let mut by_hash: std::collections::HashMap<&str, Vec<usize>> = std::collections::HashMap::new();
     for &i in &comp {
         by_hash.entry(&docs[i].exact_hash).or_default().push(i);
     }
@@ -104,11 +103,8 @@ pub fn cluster(docs: &[ScannedDoc], threshold: f64) -> Vec<Family> {
     // near / contains: candidate generation, every candidate verified.
     // LSH covers near; a bottom-k inverted index covers containment of
     // documents too small for LSH bands to see (draft inside final).
-    let mut index = gaoya::minhash::MinHashIndex::new(
-        LSH_BANDS,
-        LSH_BAND_WIDTH,
-        LSH_CANDIDATE_THRESHOLD,
-    );
+    let mut index =
+        gaoya::minhash::MinHashIndex::new(LSH_BANDS, LSH_BAND_WIDTH, candidate_threshold);
     for &i in &comp {
         index.insert(i, docs[i].sig.values.clone());
     }
@@ -156,7 +152,9 @@ pub fn cluster(docs: &[ScannedDoc], threshold: f64) -> Vec<Family> {
             continue;
         }
         let s = score(&docs[i].sig, &docs[j].sig);
-        if s >= threshold {
+        if s >= candidate_threshold
+            && exact_jaccard(&docs[i].shingles, &docs[j].shingles) >= threshold
+        {
             uf.union(i, j);
             continue;
         }
@@ -193,10 +191,7 @@ pub fn cluster(docs: &[ScannedDoc], threshold: f64) -> Vec<Family> {
     for &i in &comp {
         components.entry(uf.find(i)).or_default().push(i);
     }
-    let mut groups: Vec<Vec<usize>> = components
-        .into_values()
-        .filter(|g| g.len() >= 2)
-        .collect();
+    let mut groups: Vec<Vec<usize>> = components.into_values().filter(|g| g.len() >= 2).collect();
     groups.sort_by_key(|g| g[0]);
 
     groups
@@ -206,7 +201,9 @@ pub fn cluster(docs: &[ScannedDoc], threshold: f64) -> Vec<Family> {
             let anchor = group[0];
             let members = group
                 .iter()
-                .map(|&i| member_against_anchor(docs, i, anchor, threshold))
+                .map(|&i| {
+                    member_against_anchor(docs, i, anchor, threshold, candidate_threshold)
+                })
                 .collect();
             Family {
                 id: id as u32,
@@ -222,6 +219,7 @@ fn member_against_anchor(
     i: usize,
     anchor: usize,
     threshold: f64,
+    candidate_threshold: f64,
 ) -> FamilyMember {
     if i == anchor || docs[i].exact_hash == docs[anchor].exact_hash {
         return FamilyMember {
@@ -229,26 +227,30 @@ fn member_against_anchor(
             exact_hash: docs[i].exact_hash.clone(),
             relation: Relation::Exact,
             near_score: Some(1.0),
+            jaccard: Some(1.0),
             containment: Some(1.0),
         };
     }
     let s = score(&docs[i].sig, &docs[anchor].sig);
+    let jaccard = Some(exact_jaccard(&docs[i].shingles, &docs[anchor].shingles));
     let c_in = containment(&docs[anchor].shingles, &docs[i].shingles);
     let c_out = containment(&docs[i].shingles, &docs[anchor].shingles);
     let c = c_in.max(c_out);
-    let relation = if s >= threshold {
-        Relation::Near
-    } else if c >= threshold {
-        Relation::Contains
-    } else {
-        // Joined transitively through another member.
-        Relation::Near
-    };
+    let relation =
+        if s >= candidate_threshold && jaccard.is_some_and(|value| value >= threshold) {
+            Relation::Near
+        } else if c >= threshold {
+            Relation::Contains
+        } else {
+            // Joined transitively through another member.
+            Relation::Near
+        };
     FamilyMember {
         path: docs[i].path.clone(),
         exact_hash: docs[i].exact_hash.clone(),
         relation,
         near_score: Some(s),
+        jaccard,
         containment: Some(c),
     }
 }
@@ -282,7 +284,7 @@ impl UnionFind {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::near::DEFAULT_NEAR_THRESHOLD;
+    use crate::near::{exact_jaccard, score, DEFAULT_NEAR_THRESHOLD, MINHASH_CANDIDATE_THRESHOLD};
 
     fn doc(name: &str, text: &str) -> ScannedDoc {
         ScannedDoc::from_text(PathBuf::from(name), text)
@@ -332,6 +334,67 @@ mod tests {
     }
 
     #[test]
+    fn minhash_candidate_below_final_threshold_uses_exact_jaccard() {
+        let base = (0..240)
+            .map(|i| format!("문서고유문장{i:04}"))
+            .collect::<Vec<_>>();
+        let base_text = base.join(" ");
+        let base_doc = doc("draft.hwp", &base_text);
+        let variant_text = (1..80)
+            .find_map(|changed| {
+                let mut variant = base.clone();
+                for (i, word) in variant.iter_mut().take(changed).enumerate() {
+                    *word = format!("수정문장{i:04}");
+                }
+                let text = variant.join(" ");
+                let candidate = doc("candidate.hwp", &text);
+                let estimate = score(&base_doc.sig, &candidate.sig);
+                let jaccard = exact_jaccard(&base_doc.shingles, &candidate.shingles);
+                (estimate >= MINHASH_CANDIDATE_THRESHOLD
+                    && estimate < DEFAULT_NEAR_THRESHOLD
+                    && jaccard >= DEFAULT_NEAR_THRESHOLD)
+                    .then_some(text)
+            })
+            .expect("fixture should expose a MinHash false negative near the threshold");
+
+        let docs = vec![base_doc, doc("final.hwp", &variant_text)];
+        let families = cluster(&docs, DEFAULT_NEAR_THRESHOLD);
+        assert_eq!(families.len(), 1);
+        let near = families[0]
+            .members
+            .iter()
+            .find(|member| member.path == PathBuf::from("final.hwp"))
+            .unwrap();
+        assert_eq!(near.relation, Relation::Near);
+        assert!(near.near_score.unwrap() < DEFAULT_NEAR_THRESHOLD);
+        assert!(near.jaccard.unwrap() >= DEFAULT_NEAR_THRESHOLD);
+    }
+
+    #[test]
+    fn minhash_candidate_above_final_threshold_needs_exact_jaccard() {
+        let base_text = paragraphs("기준", 30);
+        let extended_text = format!("{base_text}\n{}", paragraphs("부록추가내용", 40));
+        let base_doc = doc("base.hwp", &base_text);
+        let mut candidate = doc("different.hwp", &extended_text);
+        assert!(exact_jaccard(&base_doc.shingles, &candidate.shingles) < DEFAULT_NEAR_THRESHOLD);
+        assert!(containment(&candidate.shingles, &base_doc.shingles) >= DEFAULT_NEAR_THRESHOLD);
+        // Simulate a MinHash overestimate deterministically: final near
+        // judgment must still use the complete shingle sets.
+        candidate.sig = base_doc.sig.clone();
+        let docs = vec![base_doc, candidate];
+        let families = cluster(&docs, DEFAULT_NEAR_THRESHOLD);
+        assert_eq!(families.len(), 1);
+        let member = families[0]
+            .members
+            .iter()
+            .find(|member| member.path == PathBuf::from("different.hwp"))
+            .unwrap();
+        assert_eq!(member.relation, Relation::Contains);
+        assert!(member.near_score.unwrap() >= DEFAULT_NEAR_THRESHOLD);
+        assert!(member.jaccard.unwrap() < DEFAULT_NEAR_THRESHOLD);
+    }
+
+    #[test]
     fn contains_family() {
         let draft = paragraphs("초안", 10);
         // Appendix uses wholly different vocabulary so Jaccard stays well
@@ -345,7 +408,10 @@ mod tests {
         ]
         .join("\n");
         let final_doc = format!("{draft}\n{appendix}");
-        let docs = vec![doc("보고서_초안.docx", &draft), doc("보고서_최종.docx", &final_doc)];
+        let docs = vec![
+            doc("보고서_초안.docx", &draft),
+            doc("보고서_최종.docx", &final_doc),
+        ];
         let fams = cluster(&docs, DEFAULT_NEAR_THRESHOLD);
         assert_eq!(fams.len(), 1, "draft inside final must still be family");
         let contains = fams[0]
@@ -362,7 +428,10 @@ mod tests {
     fn unrelated_docs_form_no_family() {
         let docs = vec![
             doc("a.txt", &proposal()),
-            doc("b.txt", "오늘 점심은 김치찌개다. 오후에는 운동을 하고 책을 읽는다."),
+            doc(
+                "b.txt",
+                "오늘 점심은 김치찌개다. 오후에는 운동을 하고 책을 읽는다.",
+            ),
         ];
         assert!(cluster(&docs, DEFAULT_NEAR_THRESHOLD).is_empty());
     }
@@ -439,5 +508,3 @@ mod tests {
         assert_ne!(fams[0].id, fams[1].id);
     }
 }
-
-
