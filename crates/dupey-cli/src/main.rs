@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use dupey_core::{
-    cluster, containment, exact_hash_hex, extract, near_sig, rank, CanonicalText,
-    Format, MemberSignals, ScannedDoc, DEFAULT_NEAR_THRESHOLD,
+    cluster, exact_hash_hex, extract, near_sig, rank, CanonicalText, Format, MemberSignals,
+    ScannedDoc, DEFAULT_NEAR_THRESHOLD,
 };
 use serde::Serialize;
 
@@ -201,13 +201,6 @@ fn scan(dir: &Path, json: bool, threshold: f64) -> Result<()> {
     if std::env::var_os("DUPEY_TIMING").is_some() {
         eprintln!("cluster: {:?}", t_cluster.elapsed());
     }
-    // Shingle sets are already computed in `docs`; reuse them instead of
-    // re-shingling per member pair (that made rank O(m^2) re-extraction).
-    let doc_index: std::collections::HashMap<&PathBuf, usize> = docs
-        .iter()
-        .enumerate()
-        .map(|(i, d)| (&d.path, i))
-        .collect();
     let mut family_out = Vec::new();
     for fam in &families {
         let signals: Vec<MemberSignals> = fam
@@ -219,29 +212,10 @@ fn scan(dir: &Path, json: bool, threshold: f64) -> Result<()> {
                     .find(|(c, _)| c.path == m.path)
                     .map(|(c, t)| (c.clone(), *t))
                     .expect("family member must come from scanned docs");
-                let my_shingles = &docs[doc_index[&m.path]].shingles;
-                let others: Vec<&Vec<u64>> = fam
-                    .members
-                    .iter()
-                    .filter(|o| o.path != m.path)
-                    .filter_map(|o| doc_index.get(&o.path))
-                    .map(|&oi| &docs[oi].shingles)
-                    .collect();
-                let contains_others = !others.is_empty()
-                    && others.iter().all(|os| {
-                        !os.is_empty() && containment(my_shingles, os) >= threshold
-                    });
-                let contained_by_other = others.iter().any(|os| {
-                    !my_shingles.is_empty() && containment(os, my_shingles) >= threshold
-                });
                 MemberSignals {
                     path: m.path.clone(),
                     internal_modified: canon.meta.modified,
                     fs_mtime,
-                    revision: canon.meta.revision,
-                    text_len: canon.text.chars().count(),
-                    contains_others,
-                    contained_by_other,
                 }
             })
             .collect();

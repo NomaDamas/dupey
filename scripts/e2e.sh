@@ -43,7 +43,7 @@ if fam:
     m = member(fam, "제안서_최종.docx")
     check("one-line edit near >= 0.85", (m["near_score"] or 0) >= 0.85,
           f"near_score={m['near_score']:.3f}")
-    check("pick is 제안서_최종.docx (internal time + 최종 token)",
+    check("pick is 제안서_최종.docx (later internal time)",
           fam["pick"]["ranked"][0]["path"].endswith("제안서_최종.docx"),
           f"confidence={fam['pick']['confidence']:.2f}")
     check("pick reasons are non-empty", len(fam["pick"]["reasons"]) > 0)

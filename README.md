@@ -24,7 +24,7 @@ dupey compare 최종.docx 찐최종.docx
 }
 ```
 
-Ranking is explainable, never a verdict: internal modified time beats filesystem mtime, containment, filename tokens (`최종`/`v3` vs `복사본`/`draft`), OOXML revision, weak length — all published with a margin-based confidence (0.5 = coin flip).
+Latest pick inside a family is **modified time only** (internal document time beats that file's filesystem mtime). Filename tokens, containment, revision, and length are not scores — they stay on the payload for the user to judge. Tied times are a coin flip (confidence 0.5).
 
 ## Develop
 
