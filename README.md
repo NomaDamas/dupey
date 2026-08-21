@@ -10,9 +10,13 @@ Status: v1 pipeline works. `txt` / `md` / `docx` / `hwpx` / binary `hwp` / `pptx
 
 ```bash
 dupey scan ./docs --json          # the public contract
+dupey scan ./docs --exclude-dir 임시 --exclude-dir 백업
 dupey fingerprint proposal.docx   # canonical text hash + internal metadata
 dupey compare 최종.docx 찐최종.docx
 ```
+
+`scan` does not descend into vendor/VCS/tooling folders (`node_modules`, `.git`, `target`, `dist`, `build`, …). Add more folder **names** with repeatable `--exclude-dir`.
+
 
 ```jsonc
 // scan DIR --json

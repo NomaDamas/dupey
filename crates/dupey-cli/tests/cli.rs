@@ -13,16 +13,25 @@ fn fixture_dir(name: &str, files: &[(&str, &str)]) -> PathBuf {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     for (fname, body) in files {
-        std::fs::write(dir.join(fname), body).unwrap();
+        let path = dir.join(fname);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, body).unwrap();
     }
     dir
 }
 
 fn scan_json(dir: &Path) -> serde_json::Value {
+    scan_json_with(dir, &[])
+}
+
+fn scan_json_with(dir: &Path, extra: &[&str]) -> serde_json::Value {
     let out = dupey()
-        .args(["scan"])
+        .arg("scan")
         .arg(dir)
         .arg("--json")
+        .args(extra)
         .output()
         .unwrap();
     assert!(
@@ -33,7 +42,17 @@ fn scan_json(dir: &Path) -> serde_json::Value {
     serde_json::from_slice(&out.stdout).unwrap()
 }
 
-const PROPOSAL: &str = "프로젝트 제안서\n\n1. 배경\n본 제안은 2026년 하반기 사무 자동화 도입을 위한 것이다. \
+fn scanned_paths(v: &serde_json::Value) -> Vec<String> {
+    v["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["path"].as_str().unwrap().replace('\\', "/"))
+        .collect()
+}
+
+const PROPOSAL: &str =
+    "프로젝트 제안서\n\n1. 배경\n본 제안은 2026년 하반기 사무 자동화 도입을 위한 것이다. \
      현재 팀은 문서가 폴더에 흩어져 있고 최신본을 찾기 어렵다.\n\n2. 범위\n문서 수집, \
      중복 정리, 검색, 권한은 1단계 범위에 포함하지 않는다.\n\n3. 일정\n킥오프는 9월 1일, \
      파일럿은 10월 말까지 진행한다.\n\n4. 예산\n예상 비용은 3,200만 원이다.\n";
@@ -101,10 +120,7 @@ fn scan_finds_near_family_and_picks_final() {
 fn scan_exact_duplicate_group() {
     let dir = fixture_dir(
         "exact",
-        &[
-            ("보고서.txt", PROPOSAL),
-            ("보고서 사본.txt", PROPOSAL),
-        ],
+        &[("보고서.txt", PROPOSAL), ("보고서 사본.txt", PROPOSAL)],
     );
     let v = scan_json(&dir);
     let families = v["families"].as_array().unwrap();
@@ -116,11 +132,18 @@ fn scan_exact_duplicate_group() {
 #[test]
 fn fingerprint_and_compare_still_work() {
     let dir = fixture_dir("basic", &[("a.txt", PROPOSAL)]);
-    let out = dupey().args(["fingerprint"]).arg(dir.join("a.txt")).output().unwrap();
+    let out = dupey()
+        .args(["fingerprint"])
+        .arg(dir.join("a.txt"))
+        .output()
+        .unwrap();
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("exact\t"), "{stdout}");
-    assert!(stdout.contains("modified\t"), "fingerprint shows meta: {stdout}");
+    assert!(
+        stdout.contains("modified\t"),
+        "fingerprint shows meta: {stdout}"
+    );
 
     let out = dupey()
         .args(["compare"])
@@ -131,4 +154,72 @@ fn fingerprint_and_compare_still_work() {
     assert!(out.status.success());
     assert!(String::from_utf8_lossy(&out.stdout).contains("exact_equal\ttrue"));
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn scan_skips_default_vendor_dirs() {
+    let dir = fixture_dir(
+        "skip-vendor",
+        &[
+            ("제안서.txt", PROPOSAL),
+            ("docs/메모.txt", "내일 회의실 예약하기\n"),
+            ("node_modules/pkg/LICENSE.md", "MIT License\n"),
+            (".git/README.md", "git readme\n"),
+            ("build/junk.txt", "build artifact\n"),
+            ("my_build_notes/keep.txt", "not a vendor dir\n"),
+        ],
+    );
+    let paths = scanned_paths(&scan_json(&dir));
+    assert!(paths.iter().any(|p| p.ends_with("제안서.txt")), "{paths:?}");
+    assert!(paths.iter().any(|p| p.ends_with("메모.txt")), "{paths:?}");
+    assert!(
+        paths.iter().any(|p| p.ends_with("keep.txt")),
+        "substring build must not skip my_build_notes: {paths:?}"
+    );
+    assert!(
+        paths.iter().all(|p| !p.contains("/node_modules/")),
+        "{paths:?}"
+    );
+    assert!(paths.iter().all(|p| !p.contains("/.git/")), "{paths:?}");
+    assert!(paths.iter().all(|p| !p.contains("/build/")), "{paths:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn scan_exclude_dir_adds_names() {
+    let dir = fixture_dir(
+        "skip-extra",
+        &[
+            ("keep.txt", PROPOSAL),
+            ("임시/버림.txt", PROPOSAL),
+            ("백업/old.txt", PROPOSAL),
+        ],
+    );
+    let paths = scanned_paths(&scan_json_with(
+        &dir,
+        &["--exclude-dir", "임시", "--exclude-dir", "./백업/"],
+    ));
+    assert_eq!(paths.len(), 1, "{paths:?}");
+    assert!(paths[0].ends_with("keep.txt"), "{paths:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn scan_root_named_like_vendor_is_still_read() {
+    let parent = std::env::temp_dir().join("dupey-cli-root-skip");
+    let _ = std::fs::remove_dir_all(&parent);
+    let dir = parent.join("node_modules");
+    std::fs::create_dir_all(dir.join("nested/node_modules")).unwrap();
+    std::fs::write(dir.join("inside.txt"), PROPOSAL).unwrap();
+    std::fs::write(dir.join("nested/node_modules/LICENSE.md"), "MIT\n").unwrap();
+    let paths = scanned_paths(&scan_json(&dir));
+    assert!(
+        paths.iter().any(|p| p.ends_with("inside.txt")),
+        "walk root named node_modules must still be scanned: {paths:?}"
+    );
+    assert!(
+        paths.iter().all(|p| !p.contains("/nested/node_modules/")),
+        "{paths:?}"
+    );
+    let _ = std::fs::remove_dir_all(&parent);
 }

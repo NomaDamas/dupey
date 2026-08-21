@@ -1,10 +1,12 @@
+mod skip;
+
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use dupey_core::{
-    cluster, containment, exact_hash_hex, extract, near_sig, rank, CanonicalText,
-    Format, MemberSignals, ScannedDoc, DEFAULT_NEAR_THRESHOLD,
+    cluster, containment, exact_hash_hex, extract, near_sig, rank, CanonicalText, Format,
+    MemberSignals, ScannedDoc, DEFAULT_NEAR_THRESHOLD,
 };
 use serde::Serialize;
 
@@ -34,6 +36,10 @@ enum Command {
         /// Family threshold for near/contains (Jaccard estimate)
         #[arg(long, default_value_t = DEFAULT_NEAR_THRESHOLD)]
         threshold: f64,
+        /// Extra directory names to skip (folder name, not a path). Repeatable.
+        /// Merged with builtins: node_modules, .git, target, dist, build, ...
+        #[arg(long = "exclude-dir", value_name = "NAME", action = clap::ArgAction::Append)]
+        exclude_dir: Vec<String>,
     },
 }
 
@@ -45,7 +51,8 @@ fn main() -> Result<()> {
             dir,
             json,
             threshold,
-        } => scan(&dir, json, threshold),
+            exclude_dir,
+        } => scan(&dir, json, threshold, &exclude_dir),
     }
 }
 
@@ -132,16 +139,20 @@ struct ScanOut {
     errors: Vec<ErrorEntry>,
 }
 
-fn scan(dir: &Path, json: bool, threshold: f64) -> Result<()> {
+fn scan(dir: &Path, json: bool, threshold: f64, extra_exclude: &[String]) -> Result<()> {
     let t0 = std::time::Instant::now();
     let mut files: Vec<FileEntry> = Vec::new();
     let mut docs: Vec<ScannedDoc> = Vec::new();
     let mut metas: Vec<(CanonicalText, Option<jiff::Timestamp>)> = Vec::new();
     let mut errors: Vec<ErrorEntry> = Vec::new();
 
+    let skip = skip::skip_set(extra_exclude);
     let mut paths: Vec<PathBuf> = Vec::new();
     for entry in walkdir::WalkDir::new(dir)
         .into_iter()
+        .filter_entry(|e| {
+            !skip::should_skip_dir(e.file_name(), e.file_type().is_dir(), e.depth(), &skip)
+        })
         .filter_map(|e| e.ok())
     {
         if entry.file_type().is_file() && Format::from_path(entry.path()).is_some() {
@@ -203,11 +214,8 @@ fn scan(dir: &Path, json: bool, threshold: f64) -> Result<()> {
     }
     // Shingle sets are already computed in `docs`; reuse them instead of
     // re-shingling per member pair (that made rank O(m^2) re-extraction).
-    let doc_index: std::collections::HashMap<&PathBuf, usize> = docs
-        .iter()
-        .enumerate()
-        .map(|(i, d)| (&d.path, i))
-        .collect();
+    let doc_index: std::collections::HashMap<&PathBuf, usize> =
+        docs.iter().enumerate().map(|(i, d)| (&d.path, i)).collect();
     let mut family_out = Vec::new();
     for fam in &families {
         let signals: Vec<MemberSignals> = fam
@@ -228,12 +236,12 @@ fn scan(dir: &Path, json: bool, threshold: f64) -> Result<()> {
                     .map(|&oi| &docs[oi].shingles)
                     .collect();
                 let contains_others = !others.is_empty()
-                    && others.iter().all(|os| {
-                        !os.is_empty() && containment(my_shingles, os) >= threshold
-                    });
-                let contained_by_other = others.iter().any(|os| {
-                    !my_shingles.is_empty() && containment(os, my_shingles) >= threshold
-                });
+                    && others
+                        .iter()
+                        .all(|os| !os.is_empty() && containment(my_shingles, os) >= threshold);
+                let contained_by_other = others
+                    .iter()
+                    .any(|os| !my_shingles.is_empty() && containment(os, my_shingles) >= threshold);
                 MemberSignals {
                     path: m.path.clone(),
                     internal_modified: canon.meta.modified,
