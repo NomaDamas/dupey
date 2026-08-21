@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use dupey_core::{
-    cluster, containment, exact_hash_hex, extract, near_sig, rank, CanonicalText,
-    Format, MemberSignals, ScannedDoc, DEFAULT_NEAR_THRESHOLD,
+    cluster, containment, exact_hash_hex, extract, near_sig, rank, shingles, CanonicalText, Format,
+    MemberSignals, NearSignature, ScannedDoc, DEFAULT_NEAR_THRESHOLD,
 };
 use serde::Serialize;
 
@@ -132,6 +132,15 @@ struct ScanOut {
     errors: Vec<ErrorEntry>,
 }
 
+struct PreparedScan {
+    canon: CanonicalText,
+    fs_mtime: Option<jiff::Timestamp>,
+    exact_hash: String,
+    sig: NearSignature,
+    shingles: Vec<u64>,
+    chars: usize,
+}
+
 fn scan(dir: &Path, json: bool, threshold: f64) -> Result<()> {
     let t0 = std::time::Instant::now();
     let mut files: Vec<FileEntry> = Vec::new();
@@ -153,7 +162,7 @@ fn scan(dir: &Path, json: bool, threshold: f64) -> Result<()> {
     // Extract + hash + signature is the scan bottleneck; it is pure I/O
     // and CPU per file, so it parallelizes cleanly. Order is preserved.
     use rayon::prelude::*;
-    let results: Vec<dupey_core::Result<(CanonicalText, Option<jiff::Timestamp>)>> = paths
+    let results: Vec<dupey_core::Result<PreparedScan>> = paths
         .par_iter()
         .map(|path| {
             let canon = extract(path)?;
@@ -163,27 +172,50 @@ fn scan(dir: &Path, json: bool, threshold: f64) -> Result<()> {
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .and_then(|d| jiff::SignedDuration::try_from(d).ok())
                 .and_then(|d| jiff::Timestamp::from_duration(d).ok());
-            Ok((canon, fs_mtime))
+            let exact_hash = exact_hash_hex(&canon.text);
+            let sig = near_sig(&canon.text);
+            let shingles = shingles(&canon.text);
+            let chars = canon.text.chars().count();
+            Ok(PreparedScan {
+                canon,
+                fs_mtime,
+                exact_hash,
+                sig,
+                shingles,
+                chars,
+            })
         })
         .collect();
     for (path, result) in paths.iter().zip(results) {
         match result {
-            Ok((canon, fs_mtime)) => {
-                let sig = near_sig(&canon.text);
+            Ok(prepared) => {
+                let PreparedScan {
+                    canon,
+                    fs_mtime,
+                    exact_hash,
+                    sig,
+                    shingles,
+                    chars,
+                } = prepared;
                 let fuzzy = (!canon.text.is_empty()).then(|| sig.values.clone());
                 files.push(FileEntry {
                     path: canon.path.display().to_string(),
                     format: canon.format,
-                    content_hash: exact_hash_hex(&canon.text),
+                    content_hash: exact_hash.clone(),
                     fuzzy,
                     signals: FileSignals {
-                        chars: canon.text.chars().count(),
+                        chars,
                         modified: canon.meta.modified.map(|t| t.to_string()),
                         revision: canon.meta.revision,
                         fs_mtime: fs_mtime.map(|t| t.to_string()),
                     },
                 });
-                docs.push(ScannedDoc::from_text(canon.path.clone(), &canon.text));
+                docs.push(ScannedDoc::from_precomputed(
+                    canon.path.clone(),
+                    exact_hash,
+                    sig,
+                    shingles,
+                ));
                 metas.push((canon, fs_mtime));
             }
             Err(e) => errors.push(ErrorEntry {
@@ -203,11 +235,8 @@ fn scan(dir: &Path, json: bool, threshold: f64) -> Result<()> {
     }
     // Shingle sets are already computed in `docs`; reuse them instead of
     // re-shingling per member pair (that made rank O(m^2) re-extraction).
-    let doc_index: std::collections::HashMap<&PathBuf, usize> = docs
-        .iter()
-        .enumerate()
-        .map(|(i, d)| (&d.path, i))
-        .collect();
+    let doc_index: std::collections::HashMap<&PathBuf, usize> =
+        docs.iter().enumerate().map(|(i, d)| (&d.path, i)).collect();
     let mut family_out = Vec::new();
     for fam in &families {
         let signals: Vec<MemberSignals> = fam
@@ -228,12 +257,12 @@ fn scan(dir: &Path, json: bool, threshold: f64) -> Result<()> {
                     .map(|&oi| &docs[oi].shingles)
                     .collect();
                 let contains_others = !others.is_empty()
-                    && others.iter().all(|os| {
-                        !os.is_empty() && containment(my_shingles, os) >= threshold
-                    });
-                let contained_by_other = others.iter().any(|os| {
-                    !my_shingles.is_empty() && containment(os, my_shingles) >= threshold
-                });
+                    && others
+                        .iter()
+                        .all(|os| !os.is_empty() && containment(my_shingles, os) >= threshold);
+                let contained_by_other = others
+                    .iter()
+                    .any(|os| !my_shingles.is_empty() && containment(os, my_shingles) >= threshold);
                 MemberSignals {
                     path: m.path.clone(),
                     internal_modified: canon.meta.modified,

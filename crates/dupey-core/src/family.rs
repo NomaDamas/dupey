@@ -7,9 +7,7 @@
 
 use std::path::PathBuf;
 
-use crate::near::{
-    containment, containment_at_least, near_sig, score, shingles, NearSignature,
-};
+use crate::near::{containment, containment_at_least, near_sig, score, shingles, NearSignature};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -56,10 +54,19 @@ pub struct ScannedDoc {
 impl ScannedDoc {
     pub fn from_text(path: PathBuf, text: &str) -> Self {
         let shingles = shingles(text);
+        Self::from_precomputed(path, crate::exact_hash_hex(text), near_sig(text), shingles)
+    }
+
+    pub fn from_precomputed(
+        path: PathBuf,
+        exact_hash: String,
+        sig: NearSignature,
+        shingles: Vec<u64>,
+    ) -> Self {
         Self {
             path,
-            exact_hash: crate::exact_hash_hex(text),
-            sig: near_sig(text),
+            exact_hash,
+            sig,
             sketch: shingles.iter().take(SKETCH_K).copied().collect(),
             shingles,
         }
@@ -90,8 +97,7 @@ pub fn cluster(docs: &[ScannedDoc], threshold: f64) -> Vec<Family> {
     let mut uf = UnionFind::new(docs.len());
 
     // exact: same canonical SHA-256.
-    let mut by_hash: std::collections::HashMap<&str, Vec<usize>> =
-        std::collections::HashMap::new();
+    let mut by_hash: std::collections::HashMap<&str, Vec<usize>> = std::collections::HashMap::new();
     for &i in &comp {
         by_hash.entry(&docs[i].exact_hash).or_default().push(i);
     }
@@ -104,11 +110,8 @@ pub fn cluster(docs: &[ScannedDoc], threshold: f64) -> Vec<Family> {
     // near / contains: candidate generation, every candidate verified.
     // LSH covers near; a bottom-k inverted index covers containment of
     // documents too small for LSH bands to see (draft inside final).
-    let mut index = gaoya::minhash::MinHashIndex::new(
-        LSH_BANDS,
-        LSH_BAND_WIDTH,
-        LSH_CANDIDATE_THRESHOLD,
-    );
+    let mut index =
+        gaoya::minhash::MinHashIndex::new(LSH_BANDS, LSH_BAND_WIDTH, LSH_CANDIDATE_THRESHOLD);
     for &i in &comp {
         index.insert(i, docs[i].sig.values.clone());
     }
@@ -193,10 +196,7 @@ pub fn cluster(docs: &[ScannedDoc], threshold: f64) -> Vec<Family> {
     for &i in &comp {
         components.entry(uf.find(i)).or_default().push(i);
     }
-    let mut groups: Vec<Vec<usize>> = components
-        .into_values()
-        .filter(|g| g.len() >= 2)
-        .collect();
+    let mut groups: Vec<Vec<usize>> = components.into_values().filter(|g| g.len() >= 2).collect();
     groups.sort_by_key(|g| g[0]);
 
     groups
@@ -345,7 +345,10 @@ mod tests {
         ]
         .join("\n");
         let final_doc = format!("{draft}\n{appendix}");
-        let docs = vec![doc("보고서_초안.docx", &draft), doc("보고서_최종.docx", &final_doc)];
+        let docs = vec![
+            doc("보고서_초안.docx", &draft),
+            doc("보고서_최종.docx", &final_doc),
+        ];
         let fams = cluster(&docs, DEFAULT_NEAR_THRESHOLD);
         assert_eq!(fams.len(), 1, "draft inside final must still be family");
         let contains = fams[0]
@@ -362,7 +365,10 @@ mod tests {
     fn unrelated_docs_form_no_family() {
         let docs = vec![
             doc("a.txt", &proposal()),
-            doc("b.txt", "오늘 점심은 김치찌개다. 오후에는 운동을 하고 책을 읽는다."),
+            doc(
+                "b.txt",
+                "오늘 점심은 김치찌개다. 오후에는 운동을 하고 책을 읽는다.",
+            ),
         ];
         assert!(cluster(&docs, DEFAULT_NEAR_THRESHOLD).is_empty());
     }
@@ -419,6 +425,32 @@ mod tests {
     }
 
     #[test]
+    fn from_precomputed_reuses_scan_fingerprint() {
+        let text = proposal();
+        let exact_hash = crate::exact_hash_hex(&text);
+        let sig = near_sig(&text);
+        let shingles = shingles(&text);
+        let expected_sig = sig.clone();
+        let expected_shingles = shingles.clone();
+
+        let d = ScannedDoc::from_precomputed(
+            PathBuf::from("prepared.txt"),
+            exact_hash.clone(),
+            sig,
+            shingles,
+        );
+
+        assert_eq!(d.path, PathBuf::from("prepared.txt"));
+        assert_eq!(d.exact_hash, exact_hash);
+        assert_eq!(d.sig, expected_sig);
+        assert_eq!(
+            d.sketch,
+            expected_shingles[..expected_shingles.len().min(SKETCH_K)].to_vec()
+        );
+        assert_eq!(d.shingles, expected_shingles);
+    }
+
+    #[test]
     fn multiple_families() {
         let p = proposal();
         let p2 = p.replace("3,200만 원", "3,500만 원");
@@ -439,5 +471,3 @@ mod tests {
         assert_ne!(fams[0].id, fams[1].id);
     }
 }
-
-
