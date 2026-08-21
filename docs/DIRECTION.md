@@ -1,78 +1,106 @@
-# 방향성
+# Direction
 
-dupey는 사무 폴더의 `최종본.docx` / `최최종본.docx` / `찐찐막.hwp`처럼 **거의 같은 문서가 파일명으로 복제되는 문제**를 푼다.
+dupey addresses the office-folder pattern where nearly identical documents
+are repeatedly saved under names such as `final.docx`, `final-final.docx`, and
+`really-final.hwp`.
 
-MinSync에 넣지 않는다. 벡터 인덱서 부속품이 되면 RAG·에이전트·DMS가 같이 못 쓴다. 코어는 독립 라이브러리 + 얇은 CLI다.
+The core remains an independent library with a thin CLI. It is not part of
+MinSync: coupling it to a vector indexer would make it harder to reuse from
+RAG systems, agents, and document management software.
 
-## 한 줄
+## In one sentence
 
-중복 파일 찾기가 아니라 **문서 가족 탐지 + 설명 가능한 정본 후보**.
+**Document-family detection with an explainable canonical candidate**, not a
+generic duplicate-file finder.
 
-## 하지 않는 것
+## Non-goals
 
-- 시맨틱 임베딩. 최종 vs 찐최종은 문장 조각 겹침이지 주제가 아님. 양식만 같은 다른 건을 한 가족으로 묶는다.
-- 바이트 해시만으로 끝내는 청소 툴. 한 줄 수정본은 SHA가 갈라진다.
-- 최신본 단정. 틀린 단정이 신뢰를 죽인다. 점수와 이유를 남긴다.
-- 자동 삭제.
-- GPU / 모델 파일 / 네트워크.
+- **Semantic embeddings.** Revisions overlap in wording, not merely in topic.
+  Semantic similarity can incorrectly group unrelated documents that share a
+  template or subject.
+- **A byte-hash-only cleaner.** A one-line edit produces a different SHA-256.
+- **An absolute "latest file" claim.** Incorrect certainty destroys trust;
+  dupey returns a candidate, its signals, and a confidence value.
+- **Automatic deletion.**
+- **GPU, model-file, or network requirements.**
 
-## 파이프라인
+## Pipeline
 
+```text
+file
+  -> extract(extension)       # format-specific comparable body text
+  -> normalized text
+       |-> SHA-256            # exact equality
+       `-> shingles -> MinHash # near equality, score 0..1
+  -> family (exact | near | contains)
+  -> rank (visible signals, not an absolute claim)
 ```
-파일
-  → extract(확장자)          # 포맷별로 다름. 비교해도 되는 본문만
-  → 정규화된 본문
-       ├─ SHA-256            # 완전 동일
-       └─ 조각 → MinHash     # 거의 같음, 점수 0~1
-  → family (exact | near | contains)
-  → rank (신호 공개, 단정 아님)
-```
 
-MinHash 점수는 Jaccard 추정이다. 사무 한두 줄 수정은 보통 **0.85~0.99**. 가족 묶기 임계값은 **0.90**부터. 같은 회사 양식의 다른 문서는 0.6~0.8에 걸릴 수 있다.
+The MinHash score estimates Jaccard similarity. Office-document revisions
+with one or two changed lines often score **0.85-0.99**. Family clustering
+starts at **0.90** by default. Different documents that use the same corporate
+template may fall around 0.6-0.8.
 
-원본 바이트에 MinHash를 치지 않는다. docx는 zip이라 저장마다 바이트가 바뀐다.
+MinHash is never computed over raw file bytes. Formats such as DOCX are ZIP
+containers whose bytes can change on every save even when their content does
+not.
 
-## 확장자별 extract (핵심 일)
+## Format-aware extraction
 
-채점기는 공통이다. 늘어나는 것은 extract다.
+Scoring is shared. New format support belongs in extraction.
 
-| 확장자 | 남길 것 | 버릴 것 | v1 |
-|---|---|---|---|
-| txt, md | 글자 | `\r\n` 통일 | 지금 |
-| docx, pptx | 단락/슬라이드 글자 | docProps, revision id | 다음 |
-| xlsx | 셀 값 | 스타일, calcChain | 이후 |
-| pdf | 추출 글자 | 생성 메타 | 다음 |
-| hwp, hwpx | 본문 글자 | 보기 메타 | 다음 (한국 사무 공백) |
-| 스캔 PDF, 이미지 | 글자 없으면 이 경로 불가 | | 제외 |
+| Extension | Keep | Discard or normalize | Status |
+| --- | --- | --- | --- |
+| `txt`, `md` | Text | Normalize line endings | Available |
+| `docx` | Paragraph text | Document properties and revision IDs | Available |
+| `pptx` | Slide text | Speaker notes and package metadata | Available |
+| `xlsx` | Cell values | Styles and calculation chains | Available |
+| `pdf` | Embedded text | Creation metadata | Available |
+| `hwp`, `hwpx` | Body text | Presentation metadata | Available |
+| Scanned PDF, image | No comparable text without OCR | N/A | Excluded |
 
-## 최신본 신호 (단정 아님)
+## Latest-version signals, not certainty
 
-가족 안 1위는 **수정 시각만**으로 고른다. 파일 안 수정 시각이 있으면 그걸 쓰고, 없으면 파일시스템 mtime. 다운로드·압축 해제가 mtime을 덮으므로 파일 안 시각이 우선이다.
+The top candidate in a family is selected by **modification time only**. An
+internal document timestamp wins when present; otherwise dupey uses the
+filesystem modification time. Internal time is preferred because downloads
+and archive extraction often overwrite filesystem timestamps.
 
-파일명 토큰(`v3`, `최종`, `복사본`), 본문 포함, revision, 길이는 점수가 아니다. 가족 멤버와 `files[].signals`에 그대로 남아 사용자가 본다.
+Filename tokens (`v3`, `final`, `copy`), containment, revision count, and
+length are not ranking scores. They remain visible in family members and
+`files[].signals` so users can judge them directly.
 
-출력 예: `가족 #17, 후보 4개, 1위 이유: 내부 수정시각이 가장 늦음, 신뢰 0.90`.
+Example interpretation:
 
-## 왜 기존 도구로 부족한가
+> Family 17 has four candidates. The top candidate has the newest internal
+> modification time. Confidence: 0.90.
 
-| 있는 것 | 빈칸 |
-|---|---|
-| jdupes, Czkawka | 완전 동일만 |
-| datasketch, text-dedup | 텍스트가 이미 있다고 가정 |
-| Co-Pietje | 포렌식, 최신본 없음 |
-| Relativity / Purview | 비싸고 기준본이 가장 긴 문서 |
-| M-Files | MD5만 |
-| rhwp, hwpxlib | 읽기만 |
+## Why existing tools leave a gap
 
-비어 있는 칸은 알고리즘 발명이 아니라 **사무 파일 정규화 + 가족 + 설명 가능한 정본 후보**다.
+| Existing category | Missing capability |
+| --- | --- |
+| jdupes, Czkawka | Exact duplicates only |
+| datasketch, text-dedup | Assume text is already extracted |
+| Co-Pietje | Forensics without latest-candidate ranking |
+| Relativity, Purview | Expensive; canonical choice may favor longest text |
+| M-Files | MD5-level duplicate detection |
+| HWP/HWPX readers | Parsing without family detection |
 
-## 기술
+The opportunity is not a novel similarity algorithm. It is the combination of
+**office-format normalization, family detection, and an explainable canonical
+candidate**.
 
-- Rust. C++ 없음.
-- MinHash/LSH: [gaoya](https://github.com/serega/gaoya)
-- SHA: `sha2`
-- 병목은 MinHash가 아니라 압축 문서 열기다. 팀 폴더 수천~수만은 파일 I/O 시간.
+## Technology
 
-## MinSync와의 관계
+- Rust, with no C++ dependency
+- MinHash/LSH through [gaoya](https://github.com/serega/gaoya)
+- SHA-256 through `sha2`
+- In typical team folders, opening compressed documents is more expensive
+  than MinHash computation; performance is primarily file-I/O bound.
 
-MinSync는 소비자. `content_hash`는 완전 동일 층이다. dupey가 가족 ID와 정본 후보를 주면 에이전트 SSOT에 쓸 수 있다. 의존 방향은 MinSync → dupey-core, 반대는 없다.
+## Relationship with MinSync
+
+MinSync is a consumer. `content_hash` represents the exact-equality layer.
+dupey can provide family IDs and canonical candidates for an agent-facing
+source of truth. The dependency direction is MinSync -> `dupey-core`, never
+the reverse.

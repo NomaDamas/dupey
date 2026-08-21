@@ -18,23 +18,6 @@ const HWPTAG_PARA_TEXT: u16 = 67;
 const FLAG_COMPRESSED: u32 = 1;
 
 pub(crate) fn extract_hwp(path: &Path) -> Result<CanonicalText> {
-    let bytes = std::fs::read(path).map_err(|source| Error::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    if let Ok(document) = rhwp::parser::parse_document(&bytes) {
-        let meta = cfb::CompoundFile::open(std::io::Cursor::new(&bytes))
-            .ok()
-            .map(|mut ole| summary_meta(path, &mut ole))
-            .unwrap_or_default();
-        return Ok(CanonicalText {
-            path: path.to_path_buf(),
-            format: Format::Hwp,
-            text: rhwp_text(&document),
-            meta,
-        });
-    }
-
     let file = std::fs::File::open(path).map_err(|source| Error::Io {
         path: path.to_path_buf(),
         source,
@@ -82,48 +65,6 @@ pub(crate) fn extract_hwp(path: &Path) -> Result<CanonicalText> {
         text,
         meta,
     })
-}
-
-fn rhwp_text(document: &rhwp::model::document::Document) -> String {
-    let mut out = String::new();
-    for section in &document.sections {
-        for paragraph in &section.paragraphs {
-            push_rhwp_paragraph(&mut out, paragraph);
-        }
-    }
-    out
-}
-
-fn push_rhwp_paragraph(out: &mut String, paragraph: &rhwp::model::paragraph::Paragraph) {
-    let text = paragraph
-        .text
-        .chars()
-        .filter(|c| !c.is_control() || matches!(c, '\t' | '\n'))
-        .collect::<String>();
-    if !text.is_empty() {
-        out.push_str(&text);
-        out.push('\n');
-    }
-
-    for control in &paragraph.controls {
-        if let rhwp::model::control::Control::Table(table) = control {
-            let mut cells = table.cells.iter().collect::<Vec<_>>();
-            cells.sort_by_key(|cell| (cell.row, cell.col));
-            let mut row = None;
-            for cell in cells {
-                if row == Some(cell.row) {
-                    if out.ends_with('\n') {
-                        out.pop();
-                    }
-                    out.push('\t');
-                }
-                row = Some(cell.row);
-                for cell_paragraph in &cell.paragraphs {
-                    push_rhwp_paragraph(out, cell_paragraph);
-                }
-            }
-        }
-    }
 }
 
 /// \005HwpSummaryInformation: OLE property set. We read PIDSI_EDITTIME
