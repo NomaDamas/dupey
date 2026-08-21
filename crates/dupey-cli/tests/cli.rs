@@ -3,6 +3,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, UNIX_EPOCH};
 
 fn dupey() -> Command {
     Command::new(env!("CARGO_BIN_EXE_dupey"))
@@ -40,6 +41,16 @@ fn scan_json_with(dir: &Path, extra: &[&str]) -> serde_json::Value {
         String::from_utf8_lossy(&out.stderr)
     );
     serde_json::from_slice(&out.stdout).unwrap()
+}
+
+fn set_mtime(path: &Path, unix_secs: u64) {
+    let t = UNIX_EPOCH + Duration::from_secs(unix_secs);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(t)
+        .unwrap();
 }
 
 fn scanned_paths(v: &serde_json::Value) -> Vec<String> {
@@ -128,7 +139,7 @@ fn scan_json_contract_shape() {
 }
 
 #[test]
-fn scan_finds_near_family_and_picks_final() {
+fn scan_finds_near_family_and_picks_newer_mtime() {
     let edited = PROPOSAL.replace("3,200만 원", "3,500만 원");
     let dir = fixture_dir(
         "near",
@@ -138,16 +149,25 @@ fn scan_finds_near_family_and_picks_final() {
             ("무관.txt", "오늘 점심은 김치찌개다. 산책을 하고 일찍 잔다."),
         ],
     );
+    // Filename says 최종 is later; filesystem time says the opposite.
+    set_mtime(&dir.join("제안서_최종.txt"), 1_700_000_000);
+    set_mtime(&dir.join("제안서.txt"), 1_800_000_000);
     let v = scan_json(&dir);
     let families = v["families"].as_array().unwrap();
     assert_eq!(families.len(), 1);
     let fam = &families[0];
     assert_eq!(fam["files"].as_array().unwrap().len(), 2);
     assert_eq!(fam["relation"], "near");
-    assert!(fam["pick"]["ranked"][0]["path"]
-        .as_str()
-        .unwrap()
-        .ends_with("제안서_최종.txt"));
+    let pick = fam["pick"]["ranked"][0]["path"].as_str().unwrap();
+    assert!(
+        pick.ends_with("제안서.txt"),
+        "pick must follow mtime, not 최종 token: {pick}"
+    );
+    let reasons = fam["pick"]["ranked"][0]["reasons"].as_array().unwrap();
+    assert!(
+        reasons.iter().all(|r| r["name"] != "filename"),
+        "filename must not rank: {reasons:?}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

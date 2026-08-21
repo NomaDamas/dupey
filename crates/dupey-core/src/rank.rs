@@ -1,9 +1,9 @@
-//! Explainable latest/canonical ranking. Not a verdict.
+//! Latest-candidate ranking by modified time only. Not a verdict.
 //!
-//! Signals: internal modified time (beats filesystem mtime), content
-//! containment, filename tokens (`v3`, `최종`, `복사본`, ...), OOXML
-//! revision, weak length. Scores, reasons, and a margin-based confidence
-//! are published; dupey never claims a single source of truth.
+//! Per file, internal modified time (docx core.xml, hwpx content.hpf,
+//! PDF /ModDate) is preferred over that file's filesystem mtime, which
+//! downloads and unzips clobber. Filename tokens, containment, revision,
+//! and length do not score; those stay on the scan payload for the user.
 
 use std::path::PathBuf;
 
@@ -28,7 +28,7 @@ pub struct FamilyRanking {
     pub family_id: u32,
     /// Ranked latest candidates, best first.
     pub ranked: Vec<RankedMember>,
-    /// Margin-based confidence of the #1 pick, 0.5 = coin flip.
+    /// Unique latest time → high; tied times → 0.5 coin flip.
     pub confidence: f64,
 }
 
@@ -39,213 +39,70 @@ pub struct MemberSignals {
     /// In-file modified time (docx core.xml, hwpx content.hpf, PDF /ModDate).
     pub internal_modified: Option<Timestamp>,
     pub fs_mtime: Option<Timestamp>,
-    pub revision: Option<u32>,
-    pub text_len: usize,
-    /// This member's text contains (>= threshold) every other member's.
-    pub contains_others: bool,
-    /// This member is contained in some other member.
-    pub contained_by_other: bool,
 }
 
-const W_INTERNAL_TIME: f64 = 3.0;
-const W_FS_TIME: f64 = 1.0;
-const W_CONTAINS: f64 = 2.0;
-const W_FILENAME: f64 = 1.0;
-const W_REVISION: f64 = 0.5;
-const W_LENGTH: f64 = 0.25;
+fn effective_time(m: &MemberSignals) -> Option<Timestamp> {
+    m.internal_modified.or(m.fs_mtime)
+}
 
-const POSITIVE_TOKENS: &[&str] = &["최종", "최최종", "찐", "final", "완료", "정본"];
-const NEGATIVE_TOKENS: &[&str] = &[
-    "복사본",
-    "사본",
-    "copy",
-    "old",
-    "draft",
-    "초안",
-    "백업",
-    "backup",
-    "원본",
-];
-
-/// Rank a family's members as latest-candidate picks with public reasons.
+/// Rank a family's members by effective modified time, latest first.
 pub fn rank(family_id: u32, signals: &[MemberSignals]) -> FamilyRanking {
-    let max_score = W_INTERNAL_TIME + W_CONTAINS + 2.0 * W_FILENAME + W_REVISION + W_LENGTH;
+    let times: Vec<Option<Timestamp>> = signals.iter().map(effective_time).collect();
+    let latest = times.iter().flatten().max().copied();
+    let unique_latest = match latest {
+        Some(max_t) => times.iter().filter(|t| **t == Some(max_t)).count() == 1,
+        None => false,
+    };
 
-    let internal_times: Vec<Timestamp> =
-        signals.iter().filter_map(|s| s.internal_modified).collect();
-    let revisions: Vec<u32> = signals.iter().filter_map(|s| s.revision).collect();
-    let versions: Vec<Option<u32>> = signals.iter().map(|s| version_of(&s.path)).collect();
-    let max_version = versions.iter().flatten().max().copied();
-
-    let mut scored: Vec<RankedMember> = signals
+    let mut scored: Vec<(Option<Timestamp>, RankedMember)> = signals
         .iter()
         .enumerate()
         .map(|(i, m)| {
-            let mut score = 0.0;
+            let is_latest = unique_latest && times[i] == latest;
             let mut reasons = Vec::new();
-
-            if let Some(t) = m.internal_modified {
-                if internal_times.len() > 1
-                    && internal_times.iter().max() == Some(&t)
-                    && internal_times.iter().min() < Some(&t)
-                {
-                    score += W_INTERNAL_TIME;
+            if is_latest {
+                if let Some(t) = m.internal_modified {
                     reasons.push(RankSignal {
                         name: "internal_modified".into(),
                         detail: format!("파일 내부 수정시각이 가장 늦음 ({t})"),
                     });
-                }
-            } else if let Some(t) = m.fs_mtime {
-                // Filesystem mtime only counts when the file itself carries
-                // no time; downloads and unzips clobber it.
-                let fs_times: Vec<Timestamp> = signals
-                    .iter()
-                    .filter(|s| s.internal_modified.is_none())
-                    .filter_map(|s| s.fs_mtime)
-                    .collect();
-                if fs_times.len() > 1
-                    && fs_times.iter().max() == Some(&t)
-                    && fs_times.iter().min() < Some(&t)
-                {
-                    score += W_FS_TIME;
+                } else if let Some(t) = m.fs_mtime {
                     reasons.push(RankSignal {
                         name: "fs_mtime".into(),
                         detail: format!("파일시스템 수정시각이 가장 늦음 ({t})"),
                     });
                 }
             }
-
-            if m.contains_others {
-                score += W_CONTAINS;
-                reasons.push(RankSignal {
-                    name: "contains".into(),
-                    detail: "본문이 다른 후보를 포함함".into(),
-                });
-            }
-
-            let (fscore, toks) = filename_score(&m.path, versions[i], max_version);
-            if fscore != 0.0 {
-                score += fscore;
-                reasons.push(RankSignal {
-                    name: "filename".into(),
-                    detail: toks.join(", "),
-                });
-            }
-
-            if let Some(r) = m.revision {
-                if revisions.len() > 1
-                    && revisions.iter().max() == Some(&r)
-                    && revisions.iter().min() < Some(&r)
-                {
-                    score += W_REVISION;
-                    reasons.push(RankSignal {
-                        name: "revision".into(),
-                        detail: format!("저장 횟수가 가장 많음 ({r})"),
-                    });
-                }
-            }
-
-            let lens: Vec<usize> = signals.iter().map(|s| s.text_len).collect();
-            if m.text_len > 0
-                && lens.iter().max() == Some(&m.text_len)
-                && lens.iter().min() < Some(&m.text_len)
-            {
-                score += W_LENGTH;
-                reasons.push(RankSignal {
-                    name: "length".into(),
-                    detail: format!("본문이 가장 김 ({}자, 약한 신호)", m.text_len),
-                });
-            }
-
-            RankedMember {
-                path: m.path.clone(),
-                rank: 0,
-                score,
-                reasons,
-            }
+            (
+                times[i],
+                RankedMember {
+                    path: m.path.clone(),
+                    rank: 0,
+                    score: if is_latest { 1.0 } else { 0.0 },
+                    reasons,
+                },
+            )
         })
         .collect();
 
-    scored.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.path.cmp(&b.path))
+    scored.sort_by(|a, b| match (a.0, b.0) {
+        (Some(ta), Some(tb)) => tb.cmp(&ta).then_with(|| a.1.path.cmp(&b.1.path)),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => a.1.path.cmp(&b.1.path),
     });
-    for (idx, m) in scored.iter_mut().enumerate() {
+    let mut ranked: Vec<RankedMember> = scored.into_iter().map(|(_, m)| m).collect();
+    for (idx, m) in ranked.iter_mut().enumerate() {
         m.rank = idx as u32 + 1;
     }
 
-    let margin = match (scored.first(), scored.get(1)) {
-        (Some(top), Some(second)) => top.score - second.score,
-        (Some(_), None) => max_score,
-        _ => 0.0,
-    };
-    let confidence = (0.5 + 0.5 * margin / max_score).clamp(0.05, 0.95);
+    let confidence = if unique_latest { 0.9 } else { 0.5 };
 
     FamilyRanking {
         family_id,
-        ranked: scored,
+        ranked,
         confidence,
     }
-}
-
-/// Filename token evidence: positive latest-ish tokens, negative
-/// copy/draft-ish tokens, and `vN` version numbers compared across the
-/// family. Contribution is capped at +/- 2 * W_FILENAME.
-fn filename_score(
-    path: &std::path::Path,
-    version: Option<u32>,
-    max_version: Option<u32>,
-) -> (f64, Vec<String>) {
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().to_lowercase())
-        .unwrap_or_default();
-    let mut score = 0.0;
-    let mut toks = Vec::new();
-    for t in POSITIVE_TOKENS {
-        if name.contains(t) {
-            score += W_FILENAME;
-            toks.push(format!("'{t}'(+)"));
-        }
-    }
-    for t in NEGATIVE_TOKENS {
-        if name.contains(t) {
-            score -= W_FILENAME;
-            toks.push(format!("'{t}'(-)"));
-        }
-    }
-    if let (Some(v), Some(max)) = (version, max_version) {
-        if v == max {
-            score += W_FILENAME;
-            toks.push(format!("버전 v{v}(+)"));
-        } else {
-            toks.push(format!("버전 v{v}(0, 최고는 v{max})"));
-        }
-    }
-    (score.clamp(-2.0 * W_FILENAME, 2.0 * W_FILENAME), toks)
-}
-
-/// Extract `v3` / `V12` style version numbers from a filename.
-fn version_of(path: &std::path::Path) -> Option<u32> {
-    let name = path.file_name()?.to_string_lossy().to_lowercase();
-    let stem = name.rsplit('.').nth(1).unwrap_or(&name);
-    let bytes = stem.as_bytes();
-    let mut best = None;
-    for (i, &b) in bytes.iter().enumerate() {
-        if b == b'v' {
-            let digits: String = bytes[i + 1..]
-                .iter()
-                .take_while(|c| c.is_ascii_digit())
-                .map(|c| *c as char)
-                .collect();
-            if !digits.is_empty() {
-                best = digits.parse::<u32>().ok().or(best);
-            }
-        }
-    }
-    best
 }
 
 #[cfg(test)]
@@ -284,32 +141,53 @@ mod tests {
             .any(|s| s.name == "internal_modified"));
     }
 
+    fn reason_names(r: &RankedMember) -> Vec<&str> {
+        r.reasons.iter().map(|s| s.name.as_str()).collect()
+    }
+
     #[test]
-    fn filename_tokens_break_ties() {
+    fn later_copy_beats_older_final_filename() {
+        let mut newer_copy = member("제안서_복사본.docx");
+        newer_copy.internal_modified = Some(ts("2026-08-10T09:00:00Z"));
+        let mut older_final = member("제안서_최종.docx");
+        older_final.internal_modified = Some(ts("2026-08-01T09:00:00Z"));
+        let r = rank(0, &[older_final, newer_copy]);
+        assert_eq!(top(&r).path, PathBuf::from("제안서_복사본.docx"));
+        assert!(!reason_names(top(&r)).contains(&"filename"));
+    }
+
+    #[test]
+    fn later_v1_beats_older_v3() {
+        let mut v1 = member("보고서_v1.docx");
+        v1.internal_modified = Some(ts("2026-08-10T09:00:00Z"));
+        let mut v3 = member("보고서_v3.docx");
+        v3.internal_modified = Some(ts("2026-08-01T09:00:00Z"));
+        let r = rank(0, &[v3, v1]);
+        assert_eq!(top(&r).path, PathBuf::from("보고서_v1.docx"));
+    }
+
+    #[test]
+    fn later_draft_beats_older_container() {
+        let mut draft = member("보고서_초안.docx");
+        draft.internal_modified = Some(ts("2026-08-10T09:00:00Z"));
+        let mut final_doc = member("보고서_최종.docx");
+        final_doc.internal_modified = Some(ts("2026-08-01T09:00:00Z"));
+        let r = rank(0, &[final_doc, draft]);
+        assert_eq!(top(&r).path, PathBuf::from("보고서_초안.docx"));
+        assert!(!reason_names(top(&r)).contains(&"contains"));
+    }
+
+    #[test]
+    fn filename_does_not_break_time_ties() {
         let a = member("제안서_최종.docx");
         let b = member("제안서_복사본.docx");
         let r = rank(0, &[b, a]);
-        assert_eq!(top(&r).path, PathBuf::from("제안서_최종.docx"));
-        assert!(top(&r).reasons.iter().any(|s| s.name == "filename"));
-    }
-
-    #[test]
-    fn version_token_scores_positive() {
-        let a = member("보고서_v3.docx");
-        let b = member("보고서_v1.docx");
-        let r = rank(0, &[b, a]);
-        assert_eq!(top(&r).path, PathBuf::from("보고서_v3.docx"));
-    }
-
-    #[test]
-    fn container_beats_contained() {
-        let mut draft = member("보고서_초안.docx");
-        draft.contained_by_other = true;
-        let mut final_doc = member("보고서_최종.docx");
-        final_doc.contains_others = true;
-        let r = rank(0, &[draft, final_doc]);
-        assert_eq!(top(&r).path, PathBuf::from("보고서_최종.docx"));
-        assert!(top(&r).reasons.iter().any(|s| s.name == "contains"));
+        assert!(
+            r.confidence <= 0.5,
+            "no times: coin flip, got {}",
+            r.confidence
+        );
+        assert!(!reason_names(top(&r)).contains(&"filename"));
     }
 
     #[test]
@@ -321,23 +199,27 @@ mod tests {
     }
 
     #[test]
-    fn clear_winner_is_confident() {
-        let mut a = member("제안서_최종_v3.docx");
+    fn unique_latest_time_is_confident() {
+        let mut a = member("제안서_복사본.docx");
         a.internal_modified = Some(ts("2026-08-05T09:00:00Z"));
-        a.contains_others = true;
-        a.revision = Some(9);
-        let mut b = member("제안서_복사본.docx");
+        let mut b = member("제안서_최종_v3.docx");
         b.internal_modified = Some(ts("2026-08-01T09:00:00Z"));
-        b.contained_by_other = true;
-        b.revision = Some(2);
         let r = rank(0, &[b, a]);
-        assert_eq!(top(&r).path, PathBuf::from("제안서_최종_v3.docx"));
+        assert_eq!(top(&r).path, PathBuf::from("제안서_복사본.docx"));
         assert!(r.confidence > 0.7, "got {}", r.confidence);
-        // reasons are explainable: at least time + contains + filename
-        let names: Vec<&str> = top(&r).reasons.iter().map(|s| s.name.as_str()).collect();
-        for expected in ["internal_modified", "contains", "filename"] {
-            assert!(names.contains(&expected), "missing reason {expected}");
-        }
+        let names = reason_names(top(&r));
+        assert_eq!(names, vec!["internal_modified"]);
+    }
+
+    #[test]
+    fn fs_mtime_ranks_when_no_internal_time() {
+        let mut a = member("a.txt");
+        a.fs_mtime = Some(ts("2026-08-01T09:00:00Z"));
+        let mut b = member("b.txt");
+        b.fs_mtime = Some(ts("2026-08-05T09:00:00Z"));
+        let r = rank(0, &[a, b]);
+        assert_eq!(top(&r).path, PathBuf::from("b.txt"));
+        assert_eq!(reason_names(top(&r)), vec!["fs_mtime"]);
     }
 
     #[test]
