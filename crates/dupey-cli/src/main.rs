@@ -1,3 +1,5 @@
+mod skip;
+
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -34,6 +36,10 @@ enum Command {
         /// Exact shingle Jaccard threshold for near/contains
         #[arg(long, default_value_t = DEFAULT_NEAR_THRESHOLD)]
         threshold: f64,
+        /// Extra directory names to skip (folder name, not a path). Repeatable.
+        /// Merged with builtins: node_modules, .git, target, dist, build, ...
+        #[arg(long = "exclude-dir", value_name = "NAME", action = clap::ArgAction::Append)]
+        exclude_dir: Vec<String>,
     },
 }
 
@@ -45,7 +51,8 @@ fn main() -> Result<()> {
             dir,
             json,
             threshold,
-        } => scan(&dir, json, threshold),
+            exclude_dir,
+        } => scan(&dir, json, threshold, &exclude_dir),
     }
 }
 
@@ -149,16 +156,20 @@ struct PreparedScan {
     chars: usize,
 }
 
-fn scan(dir: &Path, json: bool, threshold: f64) -> Result<()> {
+fn scan(dir: &Path, json: bool, threshold: f64, extra_exclude: &[String]) -> Result<()> {
     let t0 = std::time::Instant::now();
     let mut files: Vec<FileEntry> = Vec::new();
     let mut docs: Vec<ScannedDoc> = Vec::new();
     let mut metas: Vec<(CanonicalText, Option<jiff::Timestamp>)> = Vec::new();
     let mut errors: Vec<ErrorEntry> = Vec::new();
 
+    let skip = skip::skip_set(extra_exclude);
     let mut paths: Vec<PathBuf> = Vec::new();
     for entry in walkdir::WalkDir::new(dir)
         .into_iter()
+        .filter_entry(|e| {
+            !skip::should_skip_dir(e.file_name(), e.file_type().is_dir(), e.depth(), &skip)
+        })
         .filter_map(|e| e.ok())
     {
         if entry.file_type().is_file() && Format::from_path(entry.path()).is_some() {
