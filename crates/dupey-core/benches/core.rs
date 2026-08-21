@@ -6,14 +6,6 @@ use std::path::PathBuf;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use dupey_core::{cluster, extract, near_sig, score, ScannedDoc};
 
-fn proposal() -> String {
-    "프로젝트 제안서\n\n1. 배경\n본 제안은 2026년 하반기 사무 자동화 도입을 위한 것이다. \
-     현재 팀은 문서가 폴더에 흩어져 있고 최신본을 찾기 어렵다.\n\n2. 범위\n문서 수집, \
-     중복 정리, 검색, 권한은 1단계 범위에 포함하지 않는다.\n\n3. 일정\n킥오프는 9월 1일, \
-     파일럿은 10월 말까지 진행한다.\n\n4. 예산\n예상 비용은 3,200만 원이다.\n"
-        .to_string()
-}
-
 fn paragraphs(prefix: &str, n: usize) -> String {
     (1..=n)
         .map(|i| format!("{prefix} 문단 {i}: 이 문서의 {i}번째 고유 내용입니다."))
@@ -80,11 +72,28 @@ fn bench_cluster(c: &mut Criterion) {
     let mut g = c.benchmark_group("cluster");
     g.sample_size(20);
     const POOLS: &[&[&str]] = &[
-        &["예산", "집행", "결산", "감사", "회계", "송금", "세금", "청구"],
-        &["일정", "마일스톤", "킥오프", "검수", "배포", "회귀", "데모", "리허설"],
-        &["인사", "채용", "면접", "평가", "승진", "교육", "연차", "조직"],
-        &["계약", "조항", "위약", "갱신", "해지", "서명", "날인", "검토"],
-        &["서버", "배치", "로그", "지표", "알림", "장애", "복구", "용량"],
+        &[
+            "예산", "집행", "결산", "감사", "회계", "송금", "세금", "청구",
+        ],
+        &[
+            "일정",
+            "마일스톤",
+            "킥오프",
+            "검수",
+            "배포",
+            "회귀",
+            "데모",
+            "리허설",
+        ],
+        &[
+            "인사", "채용", "면접", "평가", "승진", "교육", "연차", "조직",
+        ],
+        &[
+            "계약", "조항", "위약", "갱신", "해지", "서명", "날인", "검토",
+        ],
+        &[
+            "서버", "배치", "로그", "지표", "알림", "장애", "복구", "용량",
+        ],
     ];
     for n in [100, 500] {
         // Near-dup pairs (edits) on per-pool vocabulary, rest unrelated:
@@ -100,7 +109,11 @@ fn bench_cluster(c: &mut Criterion) {
                     })
                     .collect::<Vec<_>>()
                     .join("\n");
-                let text = if i % 2 == 0 { doc } else { doc.replace("정리한다", "정리했다") };
+                let text = if i % 2 == 0 {
+                    doc
+                } else {
+                    doc.replace("정리한다", "정리했다")
+                };
                 ScannedDoc::from_text(PathBuf::from(format!("d{i}.docx")), &text)
             })
             .collect();

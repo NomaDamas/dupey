@@ -39,6 +39,17 @@ cargo bench -p dupey-core         # criterion: extract / near_sig / cluster
 ./scripts/bench.sh 10             # corpus scan benchmark (10 x 100 files)
 ```
 
+Install the pre-commit quality gate after cloning:
+
+```bash
+pre-commit install
+```
+
+It runs workspace formatting, strict Clippy (`-D warnings`), and the workspace
+test suite before every commit. See
+[docs/CONTRIBUTING.md](docs/CONTRIBUTING.md) for the manual commands and
+formatting workflow.
+
 Library crate: [`dupey-core`](crates/dupey-core). CLI binary: `dupey`.
 
 See [docs/DIRECTION.md](docs/DIRECTION.md) (why this exists) and [docs/PLAN.md](docs/PLAN.md) (what lands next).

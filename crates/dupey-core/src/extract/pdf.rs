@@ -13,9 +13,9 @@ use crate::error::{Error, Result};
 use pdf_oxide::PdfDocument;
 
 pub(crate) fn extract_pdf(path: &Path) -> Result<CanonicalText> {
-    let extraction = std::panic::catch_unwind(|| extract_document_text(path));
-    let text = match extraction {
-        Ok(Ok(text)) => text,
+    let extraction = std::panic::catch_unwind(|| extract_document(path));
+    let (text, meta) = match extraction {
+        Ok(Ok(extracted)) => extracted,
         Ok(Err(message)) => {
             return Err(Error::Extract {
                 path: path.to_path_buf(),
@@ -33,11 +33,11 @@ pub(crate) fn extract_pdf(path: &Path) -> Result<CanonicalText> {
         path: path.to_path_buf(),
         format: Format::Pdf,
         text: normalize_newlines(&text),
-        meta: pdf_meta(path),
+        meta,
     })
 }
 
-fn extract_document_text(path: &Path) -> std::result::Result<String, String> {
+fn extract_document(path: &Path) -> std::result::Result<(String, DocMeta), String> {
     let document = PdfDocument::open(path).map_err(|error| error.to_string())?;
     if document.is_encrypted() && !document.is_authenticated() {
         return Err("encrypted PDF requires a valid password".to_string());
@@ -53,7 +53,8 @@ fn extract_document_text(path: &Path) -> std::result::Result<String, String> {
             .map_err(|error| format!("page {}: {error}", page + 1))?;
         text.push_str(&page_text);
     }
-    Ok(text)
+    let meta = pdf_meta(&document);
+    Ok((text, meta))
 }
 
 fn panic_message(payload: &(dyn Any + Send)) -> &str {
@@ -66,18 +67,25 @@ fn panic_message(payload: &(dyn Any + Send)) -> &str {
 
 /// /ModDate from the Info dictionary, parsed into a Timestamp.
 /// Missing timezone is treated as UTC.
-fn pdf_meta(path: &Path) -> DocMeta {
+fn pdf_meta(document: &PdfDocument) -> DocMeta {
     let mut meta = DocMeta::default();
-    let Ok(doc) = lopdf::Document::load(path) else {
+    let Some(info) = document
+        .trailer()
+        .as_dict()
+        .and_then(|trailer| trailer.get("Info"))
+    else {
         return meta;
     };
-    let Ok(info_ref) = doc.trailer.get(b"Info").and_then(|o| o.as_reference()) else {
+    let Ok(info) = document.resolve_object(info) else {
         return meta;
     };
-    let Ok(lopdf::Object::Dictionary(info)) = doc.get_object(info_ref) else {
+    let Some(mod_date) = info.as_dict().and_then(|info| info.get("ModDate")) else {
         return meta;
     };
-    if let Ok(lopdf::Object::String(raw, _)) = info.get(b"ModDate") {
+    let Ok(mod_date) = document.resolve_object(mod_date) else {
+        return meta;
+    };
+    if let Some(raw) = mod_date.as_string() {
         meta.modified = parse_pdf_date(&String::from_utf8_lossy(raw));
     }
     meta

@@ -1,0 +1,24 @@
+default_install_hook_types: [pre-commit]
+default_stages: [pre-commit]
+
+repos:
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: cargo fmt --all -- --check
+        language: system
+        always_run: true
+        pass_filenames: false
+      - id: cargo-clippy
+        name: cargo clippy
+        entry: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        language: system
+        always_run: true
+        pass_filenames: false
+      - id: cargo-test
+        name: cargo test
+        entry: cargo test --workspace
+        language: system
+        always_run: true
+        pass_filenames: false

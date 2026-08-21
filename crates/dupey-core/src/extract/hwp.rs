@@ -233,31 +233,28 @@ fn section_text(body: &[u8]) -> String {
         if pos + size > body.len() {
             break;
         }
-        match tag_id {
-            HWPTAG_PARA_TEXT => {
-                if level > 0 {
-                    // Nested paragraph: a table cell's text. Tabs between
-                    // cells instead of the paragraph newline.
-                    if cells_in_row > 0 && out.ends_with('\n') {
-                        out.pop();
-                        out.push('\t');
-                    }
-                    cells_in_row += 1;
-                } else {
-                    cells_in_row = 0;
+        if tag_id == HWPTAG_PARA_TEXT {
+            if level > 0 {
+                // Nested paragraph: a table cell's text. Tabs between
+                // cells instead of the paragraph newline.
+                if cells_in_row > 0 && out.ends_with('\n') {
+                    out.pop();
+                    out.push('\t');
                 }
-                for chunk in body[pos..pos + size].chunks_exact(2) {
-                    let c = u16::from_le_bytes([chunk[0], chunk[1]]);
-                    match c {
-                        // Control placeholders: fields/objects. Only real
-                        // prose characters survive extract.
-                        0x0000..=0x001F | 0xE000..=0xF8FF => {}
-                        _ => out.push(char::from_u32(c as u32).unwrap_or('\u{FFFD}')),
-                    }
-                }
-                out.push('\n');
+                cells_in_row += 1;
+            } else {
+                cells_in_row = 0;
             }
-            _ => {}
+            for chunk in body[pos..pos + size].chunks_exact(2) {
+                let c = u16::from_le_bytes([chunk[0], chunk[1]]);
+                match c {
+                    // Control placeholders: fields/objects. Only real
+                    // prose characters survive extract.
+                    0x0000..=0x001F | 0xE000..=0xF8FF => {}
+                    _ => out.push(char::from_u32(c as u32).unwrap_or('\u{FFFD}')),
+                }
+            }
+            out.push('\n');
         }
         pos += size;
     }
@@ -281,11 +278,10 @@ pub(crate) mod tests {
             // HWP record sizes are in dwords; real paragraph records pad
             // text up to a 4-byte boundary.
             let mut utf16: Vec<u8> = p.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
-            while utf16.len() % 4 != 0 {
+            while !utf16.len().is_multiple_of(4) {
                 utf16.extend_from_slice(&0u16.to_le_bytes());
             }
-            let header: u32 =
-                BODYTEXT_PARA_TEXT as u32 | (0u32 << 10) | ((utf16.len() as u32 / 4) << 20);
+            let header: u32 = BODYTEXT_PARA_TEXT as u32 | ((utf16.len() as u32 / 4) << 20);
             out.extend_from_slice(&header.to_le_bytes());
             out.extend_from_slice(&utf16);
         }
@@ -431,7 +427,7 @@ pub(crate) mod tests {
         let mut out = Vec::new();
         let mut put = |tag: u16, level: u32, text: &str| {
             let mut utf16: Vec<u8> = text.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
-            while utf16.len() % 4 != 0 {
+            while !utf16.len().is_multiple_of(4) {
                 utf16.extend_from_slice(&0u16.to_le_bytes());
             }
             let header: u32 = tag as u32 | (level << 10) | ((utf16.len() as u32 / 4) << 20);

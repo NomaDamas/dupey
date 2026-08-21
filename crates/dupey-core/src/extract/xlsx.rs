@@ -57,11 +57,7 @@ fn extract_err(path: &Path, e: impl std::fmt::Display) -> Error {
     }
 }
 
-fn read_entry(
-    path: &Path,
-    zip: &mut zip::ZipArchive<std::fs::File>,
-    name: &str,
-) -> Result<String> {
+fn read_entry(path: &Path, zip: &mut zip::ZipArchive<std::fs::File>, name: &str) -> Result<String> {
     let mut entry = zip.by_name(name).map_err(|e| extract_err(path, e))?;
     let mut buf = String::new();
     entry
@@ -107,7 +103,9 @@ fn shared_strings(xml: &str) -> Vec<String> {
 
 /// cellXfs style indices whose numFmtId is a builtin date format.
 fn date_style_indices(xml: &str) -> std::collections::HashSet<usize> {
-    const DATE_FMTS: &[u32] = &[14, 15, 16, 17, 18, 19, 20, 21, 22, 27, 30, 36, 45, 46, 47, 50, 57];
+    const DATE_FMTS: &[u32] = &[
+        14, 15, 16, 17, 18, 19, 20, 21, 22, 27, 30, 36, 45, 46, 47, 50, 57,
+    ];
     let mut reader = Reader::from_str(xml);
     let mut out = std::collections::HashSet::new();
     let mut in_cellxfs = false;
@@ -228,7 +226,8 @@ fn sheet_text(
             Ok(Event::Text(e)) if in_v => {
                 if let Ok(s) = e.decode() {
                     if cell_is_shared {
-                        if let Some(v) = s.trim().parse::<usize>().ok().and_then(|i| shared.get(i)) {
+                        if let Some(v) = s.trim().parse::<usize>().ok().and_then(|i| shared.get(i))
+                        {
                             out.push_str(v);
                         }
                     } else if cell_is_date {
@@ -280,7 +279,11 @@ mod tests {
 
     /// Minimal xlsx with a styles.xml mapping style 1 to date numFmt 14
     /// and a numeric date cell (serial) styled with it.
-    fn make_xlsx_with_dates(strings: &[&str], serial_cells: &[(usize, f64)], modified: &str) -> Vec<u8> {
+    fn make_xlsx_with_dates(
+        strings: &[&str],
+        serial_cells: &[(usize, f64)],
+        modified: &str,
+    ) -> Vec<u8> {
         let sst_items: String = strings
             .iter()
             .map(|s| format!("<si><t xml:space=\"preserve\">{s}</t></si>"))
@@ -290,8 +293,12 @@ mod tests {
              <sst xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">{sst_items}</sst>"
         );
         let mut rows_xml = String::new();
-        for (i, s) in strings.iter().enumerate() {
-            rows_xml.push_str(&format!("<row r=\"{}\"><c r=\"A{}\" t=\"s\"><v>{i}</v></c></row>", i + 1, i + 1));
+        for i in 0..strings.len() {
+            rows_xml.push_str(&format!(
+                "<row r=\"{}\"><c r=\"A{}\" t=\"s\"><v>{i}</v></c></row>",
+                i + 1,
+                i + 1
+            ));
         }
         for (col, serial) in serial_cells {
             let row = strings.len() + col + 1;
@@ -430,7 +437,10 @@ mod tests {
         let path = write_tmp("dupey-xlsx-meta.xlsx", &bytes);
         let got = extract_xlsx(&path).unwrap();
         assert_eq!(got.text, "a\n");
-        assert_eq!(got.meta.modified.unwrap().to_string(), "2026-08-03T11:00:00Z");
+        assert_eq!(
+            got.meta.modified.unwrap().to_string(),
+            "2026-08-03T11:00:00Z"
+        );
         let _ = std::fs::remove_file(&path);
     }
 }

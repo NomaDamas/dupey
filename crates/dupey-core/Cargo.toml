@@ -18,7 +18,6 @@ flate2 = "1.1.9"
 gaoya.workspace = true
 hex.workspace = true
 jiff = { version = "0.2.35", features = ["serde"] }
-lopdf = "0.44.0"
 pdf_oxide = { version = "0.3.77", default-features = false, features = ["legacy-crypto"] }
 quick-xml = "0.41.0"
 rhwp.workspace = true
