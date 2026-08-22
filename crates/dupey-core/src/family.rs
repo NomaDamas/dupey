@@ -3,7 +3,7 @@
 //! exact groups by SHA-256 of canonical text, near uses LSH over MinHash
 //! candidates and exact shingle Jaccard at the family threshold (default 0.90), contains uses
 //! shingle containment for the draft-inside-final case. Documents with no
-//! comparable text (e.g. scanned PDFs) never cluster.
+//! comparable text only cluster when their original bytes are exact matches.
 
 use std::path::PathBuf;
 
@@ -49,6 +49,7 @@ pub const SKETCH_K: usize = 64;
 pub struct ScannedDoc {
     pub path: PathBuf,
     pub exact_hash: String,
+    pub byte_hash: Option<String>,
     pub sig: NearSignature,
     pub shingles: Vec<u64>,
     /// k smallest shingle hashes; inverted index key for containment
@@ -71,10 +72,23 @@ impl ScannedDoc {
         Self {
             path,
             exact_hash,
+            byte_hash: None,
             sig,
             sketch: shingles.iter().take(SKETCH_K).copied().collect(),
             shingles,
         }
+    }
+
+    pub fn from_precomputed_with_byte_hash(
+        path: PathBuf,
+        exact_hash: String,
+        byte_hash: String,
+        sig: NearSignature,
+        shingles: Vec<u64>,
+    ) -> Self {
+        let mut doc = Self::from_precomputed(path, exact_hash, sig, shingles);
+        doc.byte_hash = Some(byte_hash);
+        doc
     }
 
     /// Scanned PDFs and empty files have no comparable content.
@@ -104,6 +118,22 @@ pub fn cluster(docs: &[ScannedDoc], threshold: f64) -> Vec<Family> {
         by_hash.entry(&docs[i].exact_hash).or_default().push(i);
     }
     for group in by_hash.values() {
+        for &i in &group[1..] {
+            uf.union(group[0], i);
+        }
+    }
+    // Empty extraction cannot support fuzzy comparison, but byte-identical
+    // files are still exact duplicates (for example, copied scanned PDFs).
+    let mut by_byte_hash: std::collections::HashMap<&str, Vec<usize>> =
+        std::collections::HashMap::new();
+    for (i, doc) in docs.iter().enumerate() {
+        if !doc.comparable() {
+            if let Some(hash) = doc.byte_hash.as_deref() {
+                by_byte_hash.entry(hash).or_default().push(i);
+            }
+        }
+    }
+    for group in by_byte_hash.values() {
         for &i in &group[1..] {
             uf.union(group[0], i);
         }
@@ -197,8 +227,10 @@ pub fn cluster(docs: &[ScannedDoc], threshold: f64) -> Vec<Family> {
     // Components with 2+ members become families.
     let mut components: std::collections::HashMap<usize, Vec<usize>> =
         std::collections::HashMap::new();
-    for &i in &comp {
-        components.entry(uf.find(i)).or_default().push(i);
+    for (i, doc) in docs.iter().enumerate() {
+        if doc.comparable() || doc.byte_hash.is_some() {
+            components.entry(uf.find(i)).or_default().push(i);
+        }
     }
     let mut groups: Vec<Vec<usize>> = components.into_values().filter(|g| g.len() >= 2).collect();
     groups.sort_by_key(|g| g[0]);
@@ -228,7 +260,11 @@ fn member_against_anchor(
     threshold: f64,
     candidate_threshold: f64,
 ) -> FamilyMember {
-    if i == anchor || docs[i].exact_hash == docs[anchor].exact_hash {
+    let byte_exact = !docs[i].comparable()
+        && !docs[anchor].comparable()
+        && docs[i].byte_hash.is_some()
+        && docs[i].byte_hash == docs[anchor].byte_hash;
+    if i == anchor || docs[i].exact_hash == docs[anchor].exact_hash || byte_exact {
         return FamilyMember {
             path: docs[i].path.clone(),
             exact_hash: docs[i].exact_hash.clone(),
@@ -443,9 +479,51 @@ mod tests {
     }
 
     #[test]
-    fn empty_text_never_clusters() {
-        // Two scanned PDFs: identical (empty) text, but no content to compare.
-        let docs = vec![doc("scan1.pdf", ""), doc("scan2.pdf", "")];
+    fn byte_identical_empty_text_clusters_as_exact() {
+        let empty = near_sig("");
+        let shingles = shingles("");
+        let docs = vec![
+            ScannedDoc::from_precomputed_with_byte_hash(
+                PathBuf::from("scan1.pdf"),
+                crate::exact_hash_hex(""),
+                crate::byte_hash_hex(b"pdf"),
+                empty.clone(),
+                shingles.clone(),
+            ),
+            ScannedDoc::from_precomputed_with_byte_hash(
+                PathBuf::from("scan2.pdf"),
+                crate::exact_hash_hex(""),
+                crate::byte_hash_hex(b"pdf"),
+                empty,
+                shingles,
+            ),
+        ];
+        let fams = cluster(&docs, DEFAULT_NEAR_THRESHOLD);
+        assert_eq!(fams.len(), 1);
+        assert!(fams[0]
+            .members
+            .iter()
+            .all(|member| member.relation == Relation::Exact));
+    }
+
+    #[test]
+    fn byte_different_empty_text_does_not_cluster() {
+        let docs = vec![
+            ScannedDoc::from_precomputed_with_byte_hash(
+                PathBuf::from("scan1.pdf"),
+                crate::exact_hash_hex(""),
+                crate::byte_hash_hex(b"pdf-a"),
+                near_sig(""),
+                shingles(""),
+            ),
+            ScannedDoc::from_precomputed_with_byte_hash(
+                PathBuf::from("scan2.pdf"),
+                crate::exact_hash_hex(""),
+                crate::byte_hash_hex(b"pdf-b"),
+                near_sig(""),
+                shingles(""),
+            ),
+        ];
         assert!(cluster(&docs, DEFAULT_NEAR_THRESHOLD).is_empty());
     }
 

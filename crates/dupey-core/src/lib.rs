@@ -11,7 +11,7 @@ pub mod near;
 pub mod rank;
 
 pub use error::{Error, Result};
-pub use exact::{exact_hash, exact_hash_hex};
+pub use exact::{byte_hash, byte_hash_hex, exact_hash, exact_hash_hex};
 pub use extract::{extract, CanonicalText, DocMeta, Format};
 pub use family::{cluster, Family, FamilyMember, Relation, ScannedDoc};
 pub use near::{
