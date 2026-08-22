@@ -205,7 +205,23 @@ impl ScannedDoc {
 /// contains are always both evaluated for the same pair. Verified pairs are
 /// unioned sequentially in sorted order, which keeps the result identical
 /// run to run regardless of how the work was scheduled.
-pub fn cluster(docs: &[ScannedDoc], config: &ClusterConfig) -> Vec<Family> {
+/// Backward-compatible clustering entry point.
+///
+/// Existing `dupey-core` consumers pass one threshold; preserve that API and
+/// use the new contains defaults unless the caller opts into
+/// [`cluster_with_config`].
+pub fn cluster(docs: &[ScannedDoc], threshold: f64) -> Vec<Family> {
+    cluster_with_config(
+        docs,
+        &ClusterConfig {
+            near_threshold: threshold,
+            ..ClusterConfig::default()
+        },
+    )
+}
+
+/// Cluster with independent near and contains thresholds.
+pub fn cluster_with_config(docs: &[ScannedDoc], config: &ClusterConfig) -> Vec<Family> {
     let threshold = config.near_threshold;
     let candidate_threshold = MINHASH_CANDIDATE_THRESHOLD.min(threshold);
     // gaoya requires bands x width == signature length (128). 16x8
@@ -581,6 +597,13 @@ mod tests {
         ScannedDoc::from_text(PathBuf::from(name), text)
     }
 
+    // Most tests exercise the configurable entry point. Keep the short name
+    // local so the fixtures stay readable while the public `cluster` wrapper
+    // retains its historical `(docs, threshold)` contract.
+    fn cluster(docs: &[ScannedDoc], config: &ClusterConfig) -> Vec<Family> {
+        cluster_with_config(docs, config)
+    }
+
     fn proposal() -> String {
         "프로젝트 제안서\n\n1. 배경\n본 제안은 2026년 하반기 사무 자동화 도입을 위한 것이다. \
          현재 팀은 문서가 폴더에 흩어져 있고 최신본을 찾기 어렵다.\n\n2. 범위\n문서 수집, \
@@ -807,6 +830,15 @@ mod tests {
             .members
             .iter()
             .all(|m| m.relation == Relation::Exact));
+    }
+
+    #[test]
+    fn legacy_cluster_threshold_api_still_works() {
+        let t = proposal();
+        let docs = vec![doc("a.docx", &t), doc("b 복사본.docx", &t)];
+        let fams = super::cluster(&docs, DEFAULT_NEAR_THRESHOLD);
+        assert_eq!(fams.len(), 1);
+        assert_eq!(fams[0].label(), FamilyLabel::Exact);
     }
 
     #[test]

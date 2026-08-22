@@ -14,7 +14,8 @@ pub use error::{Error, Result};
 pub use exact::{byte_hash, byte_hash_hex, exact_hash, exact_hash_hex};
 pub use extract::{extract, CanonicalText, DocMeta, Format};
 pub use family::{
-    cluster, ClusterConfig, Family, FamilyEdge, FamilyLabel, FamilyMember, Relation, ScannedDoc,
+    cluster, cluster_with_config, ClusterConfig, Family, FamilyEdge, FamilyLabel, FamilyMember,
+    Relation, ScannedDoc,
 };
 pub use near::{
     containment, containment_at_least, exact_jaccard, near_sig, overlap, overlap_at_least, score,

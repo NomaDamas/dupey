@@ -71,6 +71,7 @@ extract(path) -> CanonicalText
 exact_hash(text) -> sha256
 near_sig(text) -> minhash
 score(signature_a, signature_b) -> 0.0..1.0
-cluster(documents, ClusterConfig) -> families
+cluster(documents, threshold) -> families
+cluster_with_config(documents, ClusterConfig) -> families
 rank(family, signals) -> ranked candidates with reasons
 ```

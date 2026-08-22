@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use dupey_core::{
-    byte_hash_hex, cluster, containment, exact_hash_hex, extract, near_sig, rank, shingles,
-    CanonicalText, ClusterConfig, Format, MemberSignals, NearSignature, ScannedDoc,
+    byte_hash_hex, cluster_with_config, containment, exact_hash_hex, extract, near_sig, rank,
+    shingles, CanonicalText, ClusterConfig, Format, MemberSignals, NearSignature, ScannedDoc,
     DEFAULT_CONTAINS_MIN_JACCARD, DEFAULT_CONTAINS_THRESHOLD, DEFAULT_NEAR_THRESHOLD,
 };
 use serde::Serialize;
@@ -302,7 +302,7 @@ fn scan(dir: &Path, json: bool, config: ClusterConfig, extra_exclude: &[String])
         eprintln!("extract+sig: {:?}", t0.elapsed());
     }
     let t_cluster = std::time::Instant::now();
-    let families = cluster(&docs, &config);
+    let families = cluster_with_config(&docs, &config);
     if std::env::var_os("DUPEY_TIMING").is_some() {
         eprintln!("cluster: {:?}", t_cluster.elapsed());
     }
