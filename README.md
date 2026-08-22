@@ -146,8 +146,12 @@ ranking without depending on the CLI.
 ```bash
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace
-./scripts/e2e.sh
+cargo test --workspace            # unit + integration (real binary, real fixtures)
+python scripts/e2e.py             # cross-platform live e2e (Linux/macOS/Windows)
+./scripts/e2e.sh                  # Unix convenience wrapper
+cargo build --workspace --release --locked
+cargo bench -p dupey-core         # criterion: extract / near_sig / cluster
+./scripts/bench.sh 10             # corpus scan benchmark (10 x 100 files)
 ```
 
 See [Contributing](docs/CONTRIBUTING.md), [Direction](docs/DIRECTION.md), and
