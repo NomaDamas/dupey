@@ -111,7 +111,7 @@ jobs:
           cargo clippy --workspace --all-targets --all-features -- -D warnings
           cargo test --workspace --locked
           cargo build --workspace --release --locked
-          cargo package --locked -p dupey-core
+          cargo package --locked --allow-dirty -p dupey-core
 
       - name: Commit version bump
         env:
