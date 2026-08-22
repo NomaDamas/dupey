@@ -5,8 +5,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use dupey_core::{
-    byte_hash_hex, cluster, containment, exact_hash_hex, extract, near_sig, rank, shingles,
-    CanonicalText, Format, MemberSignals, NearSignature, ScannedDoc, DEFAULT_NEAR_THRESHOLD,
+    byte_hash_hex, cluster_with_config, containment, exact_hash_hex, extract, near_sig, rank,
+    shingles, CanonicalText, ClusterConfig, Format, MemberSignals, NearSignature, ScannedDoc,
+    DEFAULT_CONTAINS_MIN_JACCARD, DEFAULT_CONTAINS_THRESHOLD, DEFAULT_NEAR_THRESHOLD,
 };
 use serde::Serialize;
 
@@ -33,9 +34,19 @@ enum Command {
         /// Emit the public JSON contract instead of a human summary
         #[arg(long)]
         json: bool,
-        /// Exact shingle Jaccard threshold for near/contains
+        /// Exact shingle Jaccard required to join two files as `near`
         #[arg(long, default_value_t = DEFAULT_NEAR_THRESHOLD)]
         threshold: f64,
+        /// Shingle containment required to join two files as `contains`.
+        /// Separate from --threshold, and stricter by default: containment
+        /// divides by the smaller file, so a shared template alone can fill
+        /// 90% of a short document.
+        #[arg(long, default_value_t = DEFAULT_CONTAINS_THRESHOLD)]
+        contains_threshold: f64,
+        /// Jaccard floor a `contains` pair must also clear, so a short
+        /// fragment quoted by many long files cannot chain them together
+        #[arg(long, default_value_t = DEFAULT_CONTAINS_MIN_JACCARD)]
+        contains_min_jaccard: f64,
         /// Extra directory names to skip (folder name, not a path). Repeatable.
         /// Merged with builtins: node_modules, .git, target, dist, build, ...
         #[arg(long = "exclude-dir", value_name = "NAME", action = clap::ArgAction::Append)]
@@ -51,8 +62,19 @@ fn main() -> Result<()> {
             dir,
             json,
             threshold,
+            contains_threshold,
+            contains_min_jaccard,
             exclude_dir,
-        } => scan(&dir, json, threshold, &exclude_dir),
+        } => scan(
+            &dir,
+            json,
+            ClusterConfig {
+                near_threshold: threshold,
+                contains_threshold,
+                contains_min_jaccard,
+            },
+            &exclude_dir,
+        ),
     }
 }
 
@@ -125,9 +147,14 @@ struct ErrorEntry {
 #[derive(Serialize)]
 struct FamilyOut {
     id: u32,
-    relation: dupey_core::Relation,
+    /// `mixed` when members joined by different relations: the family label
+    /// is never collapsed into whichever relation wins a priority list.
+    relation: dupey_core::FamilyLabel,
     files: Vec<String>,
     members: Vec<dupey_core::FamilyMember>,
+    /// Every verified pair behind this family, so a caller can see which
+    /// comparison produced the merge instead of trusting the label.
+    edges: Vec<dupey_core::FamilyEdge>,
     pick: PickOut,
 }
 
@@ -141,7 +168,12 @@ struct PickOut {
 #[derive(Serialize)]
 struct ScanOut {
     dir: String,
+    /// Jaccard threshold for `near`.
     threshold: f64,
+    /// Containment threshold for `contains`.
+    contains_threshold: f64,
+    /// Jaccard floor for `contains`.
+    contains_min_jaccard: f64,
     files: Vec<FileEntry>,
     families: Vec<FamilyOut>,
     errors: Vec<ErrorEntry>,
@@ -157,7 +189,7 @@ struct PreparedScan {
     chars: usize,
 }
 
-fn scan(dir: &Path, json: bool, threshold: f64, extra_exclude: &[String]) -> Result<()> {
+fn scan(dir: &Path, json: bool, config: ClusterConfig, extra_exclude: &[String]) -> Result<()> {
     anyhow::ensure!(dir.exists(), "scan path does not exist: {}", dir.display());
 
     let t0 = std::time::Instant::now();
@@ -270,7 +302,7 @@ fn scan(dir: &Path, json: bool, threshold: f64, extra_exclude: &[String]) -> Res
         eprintln!("extract+sig: {:?}", t0.elapsed());
     }
     let t_cluster = std::time::Instant::now();
-    let families = cluster(&docs, threshold);
+    let families = cluster_with_config(&docs, &config);
     if std::env::var_os("DUPEY_TIMING").is_some() {
         eprintln!("cluster: {:?}", t_cluster.elapsed());
     }
@@ -293,30 +325,16 @@ fn scan(dir: &Path, json: bool, threshold: f64, extra_exclude: &[String]) -> Res
             })
             .collect();
         let ranking = rank(fam.id, &signals);
-        let relation = if fam
-            .members
-            .iter()
-            .all(|m| m.relation == dupey_core::Relation::Exact)
-        {
-            dupey_core::Relation::Exact
-        } else if fam
-            .members
-            .iter()
-            .any(|m| m.relation == dupey_core::Relation::Near)
-        {
-            dupey_core::Relation::Near
-        } else {
-            dupey_core::Relation::Contains
-        };
         family_out.push(FamilyOut {
             id: fam.id,
-            relation,
+            relation: fam.label(),
             files: fam
                 .members
                 .iter()
                 .map(|m| m.path.display().to_string())
                 .collect(),
             members: fam.members.clone(),
+            edges: fam.edges.clone(),
             pick: PickOut {
                 reasons: ranking
                     .ranked
@@ -331,7 +349,9 @@ fn scan(dir: &Path, json: bool, threshold: f64, extra_exclude: &[String]) -> Res
 
     let out = ScanOut {
         dir: dir.display().to_string(),
-        threshold,
+        threshold: config.near_threshold,
+        contains_threshold: config.contains_threshold,
+        contains_min_jaccard: config.contains_min_jaccard,
         files,
         families: family_out,
         errors,
@@ -352,6 +372,19 @@ fn scan(dir: &Path, json: bool, threshold: f64, extra_exclude: &[String]) -> Res
                 f.files.len(),
                 f.pick.confidence
             );
+            for m in &f.members {
+                match (&m.joined_with, m.jaccard, m.containment) {
+                    (Some(other), Some(jaccard), Some(containment)) => println!(
+                        "  {}\t{:?}\tjaccard {:.3}\tcontainment {:.3}\tvs {}",
+                        m.path.display(),
+                        m.relation,
+                        jaccard,
+                        containment,
+                        other.display()
+                    ),
+                    _ => println!("  {}\t{:?}", m.path.display(), m.relation),
+                }
+            }
             if let Some(top) = f.pick.ranked.first() {
                 println!("  pick\t{}", top.path.display());
                 for r in &top.reasons {

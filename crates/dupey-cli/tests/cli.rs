@@ -223,6 +223,137 @@ fn scan_exact_duplicate_group() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Deterministic pseudo-text with no shared template vocabulary, mirroring
+/// the core fixture: different seeds share almost no character 5-grams.
+fn noise(seed: u64, lines: usize) -> String {
+    const SYLLABLES: &[char] = &[
+        '가', '나', '다', '라', '마', '바', '사', '아', '자', '차', '카', '타', '파', '하', '거',
+        '너', '더', '러', '머', '버', '서', '어', '저', '처', '커', '터', '퍼', '허',
+    ];
+    let mut state = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(7);
+    let mut out = String::new();
+    for _ in 0..lines {
+        for _ in 0..40 {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            out.push(SYLLABLES[(state >> 33) as usize % SYLLABLES.len()]);
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// Two documents sharing one boilerplate block, differing only in a short
+/// unique body: the corporate-template shape from issue #3.
+fn template_siblings() -> Vec<(String, String)> {
+    let boilerplate = noise(1, 93);
+    (0..2)
+        .map(|i| {
+            (
+                format!("양식_{i}.txt"),
+                format!("{boilerplate}{}", noise(100 + i as u64, 7)),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn scan_keeps_template_siblings_out_of_one_family() {
+    let siblings = template_siblings();
+    let files: Vec<(&str, &str)> = siblings
+        .iter()
+        .map(|(name, body)| (name.as_str(), body.as_str()))
+        .collect();
+    let dir = fixture_dir("template-siblings", &files);
+
+    let v = scan_json(&dir);
+    assert!(
+        v["families"].as_array().unwrap().is_empty(),
+        "shared-template siblings must not merge at the default contains gate: {v}"
+    );
+
+    // The same pair merges once contains is told to use the near threshold,
+    // which proves the gate is what kept them apart.
+    let relaxed = scan_json_with(&dir, &["--contains-threshold", "0.90"]);
+    assert_eq!(
+        relaxed["families"].as_array().unwrap().len(),
+        1,
+        "lowering only the contains threshold must merge them: {relaxed}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn scan_exposes_thresholds_and_join_evidence() {
+    let draft = noise(7, 40);
+    let final_doc = format!("{draft}{}", noise(8, 40));
+    let dir = fixture_dir(
+        "evidence",
+        &[("계획_초안.txt", &draft), ("계획_최종.txt", &final_doc)],
+    );
+    let v = scan_json(&dir);
+
+    assert_eq!(v["threshold"], 0.90, "near threshold stays reported: {v}");
+    assert_eq!(v["contains_threshold"], 0.96, "{v}");
+
+    let family = &v["families"][0];
+    let edges = family["edges"].as_array().expect("family exposes edges");
+    assert_eq!(edges.len(), 1, "{edges:?}");
+    let edge = &edges[0];
+    assert_eq!(edge["relation"], "contains");
+    assert!(
+        edge["a"].as_str().unwrap().ends_with("계획_최종.txt"),
+        "a is the container: {edge}"
+    );
+    assert!(
+        edge["b"].as_str().unwrap().ends_with("계획_초안.txt"),
+        "b is the contained: {edge}"
+    );
+    assert!(edge["containment"].as_f64().unwrap() >= 0.96, "{edge}");
+    assert!(edge["jaccard"].as_f64().unwrap() < 0.90, "{edge}");
+
+    // Every member names the counterpart it actually matched.
+    for member in family["members"].as_array().unwrap() {
+        assert_eq!(member["relation"], "contains", "{member}");
+        let joined = member["joined_with"].as_str().expect("joined_with is set");
+        assert_ne!(joined, member["path"].as_str().unwrap());
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn scan_labels_split_relations_as_mixed() {
+    let draft = noise(7, 40);
+    let final_doc = format!("{draft}{}", noise(8, 40));
+    let edited = draft.replacen('가', "나", 3);
+    let dir = fixture_dir(
+        "mixed",
+        &[
+            ("계획_초안.txt", &draft),
+            ("계획_최종.txt", &final_doc),
+            ("계획_초안_수정.txt", &edited),
+        ],
+    );
+    let v = scan_json(&dir);
+    let family = &v["families"][0];
+    assert_eq!(
+        family["relation"], "mixed",
+        "a family joined by two relations must not be folded into one: {family}"
+    );
+    let relations: Vec<&str> = family["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["relation"].as_str().unwrap())
+        .collect();
+    assert!(relations.contains(&"near"), "{relations:?}");
+    assert!(relations.contains(&"contains"), "{relations:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn scan_groups_byte_identical_empty_pdfs() {
     let dir = fixture_dir("empty-pdf-exact", &[("scan-a.pdf", "")]);

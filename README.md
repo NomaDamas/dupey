@@ -118,9 +118,34 @@ candidate with reasons and confidence, never a claim of absolute truth.
   "families": [
     {
       "id": 1,
-      "relation": "near",
+      // "exact" | "near" | "contains", or "mixed" when members joined
+      // by different relations
+      "relation": "mixed",
       "files": ["documents/proposal.docx", "documents/proposal-final.docx"],
-      "members": ["..."],
+      // each member names the file it actually matched, and how
+      "members": [
+        {
+          "path": "documents/proposal-final.docx",
+          "relation": "contains",
+          "joined_with": "documents/proposal.docx",
+          "near_score": 0.62,
+          "jaccard": 0.58,
+          "containment": 0.98,
+          "exact_hash": "..."
+        }
+      ],
+      // every verified pair behind this family; for "contains",
+      // a is the container and b the contained document
+      "edges": [
+        {
+          "relation": "contains",
+          "a": "documents/proposal-final.docx",
+          "b": "documents/proposal.docx",
+          "near_score": 0.62,
+          "jaccard": 0.58,
+          "containment": 0.98
+        }
+      ],
       "pick": {
         "ranked": ["..."],
         "reasons": ["..."],
@@ -132,7 +157,21 @@ candidate with reasons and confidence, never a claim of absolute truth.
 }
 ```
 
+`threshold`, `contains_threshold`, and `contains_min_jaccard` are echoed at
+the top level so a consumer can see which gates produced the families.
+
 The exact machine-readable schema is defined by `dupey scan DIR --json`.
+
+### Why near and contains have separate gates
+
+`near` compares with Jaccard, whose denominator is the union of both
+documents. `contains` compares with containment, whose denominator is only
+the smaller document, so the same number is a far weaker bar: a shared
+corporate template can fill 90% of a short document without the two being
+versions of each other. `contains` therefore has its own, stricter threshold
+(`--contains-threshold`, default 0.96) plus a Jaccard floor
+(`--contains-min-jaccard`, default 0.40) that stops a short fragment quoted
+by many long files from chaining them into one family.
 
 ## Library
 
