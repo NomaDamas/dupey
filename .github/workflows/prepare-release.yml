@@ -11,7 +11,6 @@ on:
 
 permissions:
   contents: write
-  actions: write
 
 concurrency:
   group: prepare-release
@@ -21,8 +20,21 @@ jobs:
   prepare:
     name: Bump, tag, and create release
     runs-on: ubuntu-latest
+    environment: release
+    if: github.ref == 'refs/heads/main'
 
     steps:
+      - name: Allow organization owners only
+        env:
+          RELEASE_OWNERS: ${{ vars.RELEASE_OWNERS }}
+        shell: bash
+        run: |
+          owners=",${RELEASE_OWNERS// /},"
+          if [[ "$owners" != *",${GITHUB_ACTOR},"* ]]; then
+            echo "Only NomaDamas organization owners may prepare releases."
+            exit 1
+          fi
+
       - name: Check out main
         uses: actions/checkout@v5
         with:
@@ -124,12 +136,3 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_VERSION: ${{ inputs.version }}
         run: gh release create "v${RELEASE_VERSION}" --verify-tag --generate-notes
-
-      - name: Start OIDC publish workflow
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_VERSION: ${{ inputs.version }}
-        run: |
-          gh workflow run release.yml \
-            --ref "v${RELEASE_VERSION}" \
-            -f "version=${RELEASE_VERSION}"

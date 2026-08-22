@@ -139,6 +139,21 @@ fn scan_json_contract_shape() {
 }
 
 #[test]
+fn scan_rejects_nonexistent_directory() {
+    let dir = std::env::temp_dir().join("dupey-cli-does-not-exist");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let out = dupey().arg("scan").arg(&dir).output().unwrap();
+
+    assert!(!out.status.success(), "missing scan path must fail");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("scan path does not exist"),
+        "unexpected error: {stderr}"
+    );
+}
+
+#[test]
 fn scan_finds_near_family_and_picks_newer_mtime() {
     let edited = PROPOSAL.replace("3,200만 원", "3,500만 원");
     let dir = fixture_dir(

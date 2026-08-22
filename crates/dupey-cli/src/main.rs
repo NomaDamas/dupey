@@ -157,6 +157,8 @@ struct PreparedScan {
 }
 
 fn scan(dir: &Path, json: bool, threshold: f64, extra_exclude: &[String]) -> Result<()> {
+    anyhow::ensure!(dir.exists(), "scan path does not exist: {}", dir.display());
+
     let t0 = std::time::Instant::now();
     let mut files: Vec<FileEntry> = Vec::new();
     let mut docs: Vec<ScannedDoc> = Vec::new();
