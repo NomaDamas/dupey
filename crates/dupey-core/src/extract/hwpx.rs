@@ -22,9 +22,7 @@ pub(crate) fn extract_hwpx(path: &Path) -> Result<CanonicalText> {
 
     let mut sections: Vec<String> = (0..zip.len())
         .filter_map(|i| zip.by_index(i).ok().map(|e| e.name().to_string()))
-        .filter(|name| {
-            name.starts_with("Contents/section") && name.ends_with(".xml")
-        })
+        .filter(|name| name.starts_with("Contents/section") && name.ends_with(".xml"))
         .collect();
     sections.sort();
     if sections.is_empty() {
@@ -55,11 +53,7 @@ fn extract_err(path: &Path, e: impl std::fmt::Display) -> Error {
     }
 }
 
-fn read_entry(
-    path: &Path,
-    zip: &mut zip::ZipArchive<std::fs::File>,
-    name: &str,
-) -> Result<String> {
+fn read_entry(path: &Path, zip: &mut zip::ZipArchive<std::fs::File>, name: &str) -> Result<String> {
     let mut entry = zip.by_name(name).map_err(|e| extract_err(path, e))?;
     let mut buf = String::new();
     entry
@@ -131,11 +125,7 @@ mod tests {
     fn make_hwpx(paragraphs: &[&str], date: &str) -> Vec<u8> {
         let runs: String = paragraphs
             .iter()
-            .map(|p| {
-                format!(
-                    "<hp:p><hp:run><hp:secPr/><hp:ctrl/><hp:t>{p}</hp:t></hp:run></hp:p>"
-                )
-            })
+            .map(|p| format!("<hp:p><hp:run><hp:secPr/><hp:ctrl/><hp:t>{p}</hp:t></hp:run></hp:p>"))
             .collect();
         let section = format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\

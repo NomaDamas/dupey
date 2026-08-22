@@ -187,7 +187,7 @@ mod tests {
             "no times: coin flip, got {}",
             r.confidence
         );
-        assert!(!reason_names(top(&r)).iter().any(|n| *n == "filename"));
+        assert!(!reason_names(top(&r)).contains(&"filename"));
     }
 
     #[test]

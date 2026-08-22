@@ -59,10 +59,19 @@ pub struct ScannedDoc {
 impl ScannedDoc {
     pub fn from_text(path: PathBuf, text: &str) -> Self {
         let shingles = shingles(text);
+        Self::from_precomputed(path, crate::exact_hash_hex(text), near_sig(text), shingles)
+    }
+
+    pub fn from_precomputed(
+        path: PathBuf,
+        exact_hash: String,
+        sig: NearSignature,
+        shingles: Vec<u64>,
+    ) -> Self {
         Self {
             path,
-            exact_hash: crate::exact_hash_hex(text),
-            sig: near_sig(text),
+            exact_hash,
+            sig,
             sketch: shingles.iter().take(SKETCH_K).copied().collect(),
             shingles,
         }
@@ -201,9 +210,7 @@ pub fn cluster(docs: &[ScannedDoc], threshold: f64) -> Vec<Family> {
             let anchor = group[0];
             let members = group
                 .iter()
-                .map(|&i| {
-                    member_against_anchor(docs, i, anchor, threshold, candidate_threshold)
-                })
+                .map(|&i| member_against_anchor(docs, i, anchor, threshold, candidate_threshold))
                 .collect();
             Family {
                 id: id as u32,
@@ -236,15 +243,14 @@ fn member_against_anchor(
     let c_in = containment(&docs[anchor].shingles, &docs[i].shingles);
     let c_out = containment(&docs[i].shingles, &docs[anchor].shingles);
     let c = c_in.max(c_out);
-    let relation =
-        if s >= candidate_threshold && jaccard.is_some_and(|value| value >= threshold) {
-            Relation::Near
-        } else if c >= threshold {
-            Relation::Contains
-        } else {
-            // Joined transitively through another member.
-            Relation::Near
-        };
+    let relation = if s >= candidate_threshold && jaccard.is_some_and(|value| value >= threshold) {
+        Relation::Near
+    } else if c >= threshold {
+        Relation::Contains
+    } else {
+        // Joined transitively through another member.
+        Relation::Near
+    };
     FamilyMember {
         path: docs[i].path.clone(),
         exact_hash: docs[i].exact_hash.clone(),
@@ -285,6 +291,7 @@ impl UnionFind {
 mod tests {
     use super::*;
     use crate::near::{exact_jaccard, score, DEFAULT_NEAR_THRESHOLD, MINHASH_CANDIDATE_THRESHOLD};
+    use std::path::Path;
 
     fn doc(name: &str, text: &str) -> ScannedDoc {
         ScannedDoc::from_text(PathBuf::from(name), text)
@@ -350,8 +357,7 @@ mod tests {
                 let candidate = doc("candidate.hwp", &text);
                 let estimate = score(&base_doc.sig, &candidate.sig);
                 let jaccard = exact_jaccard(&base_doc.shingles, &candidate.shingles);
-                (estimate >= MINHASH_CANDIDATE_THRESHOLD
-                    && estimate < DEFAULT_NEAR_THRESHOLD
+                ((MINHASH_CANDIDATE_THRESHOLD..DEFAULT_NEAR_THRESHOLD).contains(&estimate)
                     && jaccard >= DEFAULT_NEAR_THRESHOLD)
                     .then_some(text)
             })
@@ -363,7 +369,7 @@ mod tests {
         let near = families[0]
             .members
             .iter()
-            .find(|member| member.path == PathBuf::from("final.hwp"))
+            .find(|member| member.path == Path::new("final.hwp"))
             .unwrap();
         assert_eq!(near.relation, Relation::Near);
         assert!(near.near_score.unwrap() < DEFAULT_NEAR_THRESHOLD);
@@ -387,7 +393,7 @@ mod tests {
         let member = families[0]
             .members
             .iter()
-            .find(|member| member.path == PathBuf::from("different.hwp"))
+            .find(|member| member.path == Path::new("different.hwp"))
             .unwrap();
         assert_eq!(member.relation, Relation::Contains);
         assert!(member.near_score.unwrap() >= DEFAULT_NEAR_THRESHOLD);
@@ -485,6 +491,32 @@ mod tests {
     fn sketch_is_prefix_of_sorted_shingles() {
         let d = doc("a.txt", &paragraphs("x", 20));
         assert_eq!(d.sketch, d.shingles[..d.sketch.len()].to_vec());
+    }
+
+    #[test]
+    fn from_precomputed_reuses_scan_fingerprint() {
+        let text = proposal();
+        let exact_hash = crate::exact_hash_hex(&text);
+        let sig = near_sig(&text);
+        let shingles = shingles(&text);
+        let expected_sig = sig.clone();
+        let expected_shingles = shingles.clone();
+
+        let d = ScannedDoc::from_precomputed(
+            PathBuf::from("prepared.txt"),
+            exact_hash.clone(),
+            sig,
+            shingles,
+        );
+
+        assert_eq!(d.path, PathBuf::from("prepared.txt"));
+        assert_eq!(d.exact_hash, exact_hash);
+        assert_eq!(d.sig, expected_sig);
+        assert_eq!(
+            d.sketch,
+            expected_shingles[..expected_shingles.len().min(SKETCH_K)].to_vec()
+        );
+        assert_eq!(d.shingles, expected_shingles);
     }
 
     #[test]

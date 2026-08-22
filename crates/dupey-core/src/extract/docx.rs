@@ -37,11 +37,7 @@ fn extract_err(path: &Path, e: impl std::fmt::Display) -> Error {
     }
 }
 
-fn read_entry(
-    path: &Path,
-    zip: &mut zip::ZipArchive<std::fs::File>,
-    name: &str,
-) -> Result<String> {
+fn read_entry(path: &Path, zip: &mut zip::ZipArchive<std::fs::File>, name: &str) -> Result<String> {
     let mut entry = zip.by_name(name).map_err(|e| extract_err(path, e))?;
     let mut buf = String::new();
     entry
@@ -58,10 +54,11 @@ fn document_text(xml: &str) -> String {
     let mut in_text = false;
     loop {
         match reader.read_event() {
-            Ok(Event::Start(e)) => match e.local_name().as_ref() {
-                b"t" => in_text = true,
-                _ => {}
-            },
+            Ok(Event::Start(e)) => {
+                if e.local_name().as_ref() == b"t" {
+                    in_text = true;
+                }
+            }
             Ok(Event::End(e)) => match e.local_name().as_ref() {
                 b"t" => in_text = false,
                 b"p" => out.push('\n'),

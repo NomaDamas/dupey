@@ -22,4 +22,3 @@ serde_json = "1"
 sha2 = "0.10"
 thiserror = "2"
 walkdir = "2"
-rhwp = { git = "https://github.com/edwardkim/rhwp.git", tag = "v0.8.4", default-features = false }

@@ -53,8 +53,8 @@ fn write_docx(path: &Path, paragraphs: &[&str], modified: &str, revision: u32) {
     );
     let file = std::fs::File::create(path).unwrap();
     let mut zip = zip::ZipWriter::new(file);
-    let opts =
-        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    let opts = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
     zip.start_file("word/document.xml", opts).unwrap();
     zip.write_all(document.as_bytes()).unwrap();
     zip.start_file("docProps/core.xml", opts).unwrap();
@@ -84,8 +84,8 @@ fn write_hwpx(path: &Path, paragraphs: &[&str], date: &str) {
     );
     let file = std::fs::File::create(path).unwrap();
     let mut zip = zip::ZipWriter::new(file);
-    let opts =
-        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    let opts = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
     zip.start_file("mimetype", opts).unwrap();
     zip.write_all(b"application/hwp+zip").unwrap();
     zip.start_file("Contents/content.hpf", opts).unwrap();
@@ -99,7 +99,7 @@ fn write_hwp(path: &Path, paras: &[&str]) {
     let mut section = Vec::new();
     let mut put_record = |tag: u16, level: u32, text: &str| {
         let mut utf16: Vec<u8> = text.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
-        while utf16.len() % 4 != 0 {
+        while !utf16.len().is_multiple_of(4) {
             utf16.extend_from_slice(&0u16.to_le_bytes());
         }
         let header: u32 = tag as u32 | (level << 10) | ((utf16.len() as u32 / 4) << 20);
@@ -134,8 +134,8 @@ fn write_hwp(path: &Path, paras: &[&str]) {
 fn write_pptx(path: &Path, slides: &[&str], modified: &str) {
     let file = std::fs::File::create(path).unwrap();
     let mut zip = zip::ZipWriter::new(file);
-    let opts =
-        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    let opts = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
     for (i, text) in slides.iter().enumerate() {
         let slide = format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
@@ -145,7 +145,8 @@ fn write_pptx(path: &Path, slides: &[&str], modified: &str) {
              <a:p><a:r><a:t>{text}</a:t></a:r></a:p>\
              </p:txBody></p:sp></p:spTree></p:cSld></p:sld>"
         );
-        zip.start_file(format!("ppt/slides/slide{}.xml", i + 1), opts).unwrap();
+        zip.start_file(format!("ppt/slides/slide{}.xml", i + 1), opts)
+            .unwrap();
         zip.write_all(slide.as_bytes()).unwrap();
     }
     let core = format!(
@@ -177,7 +178,11 @@ fn write_xlsx(path: &Path, strings: &[&str], rows: &[&[usize]], modified: &str) 
                 .iter()
                 .enumerate()
                 .map(|(c, &si)| {
-                    format!("<c r=\"{}{}\" t=\"s\"><v>{si}</v></c>", (b'A' + c as u8) as char, r + 1)
+                    format!(
+                        "<c r=\"{}{}\" t=\"s\"><v>{si}</v></c>",
+                        (b'A' + c as u8) as char,
+                        r + 1
+                    )
                 })
                 .collect();
             format!("<row r=\"{}\">{cells}</row>", r + 1)
@@ -197,8 +202,8 @@ fn write_xlsx(path: &Path, strings: &[&str], rows: &[&[usize]], modified: &str) 
     );
     let file = std::fs::File::create(path).unwrap();
     let mut zip = zip::ZipWriter::new(file);
-    let opts =
-        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    let opts = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
     zip.start_file("xl/sharedStrings.xml", opts).unwrap();
     zip.write_all(sst.as_bytes()).unwrap();
     zip.start_file("xl/worksheets/sheet1.xml", opts).unwrap();
@@ -228,7 +233,10 @@ fn write_pdf(path: &Path, lines: &[&str], mod_date: Option<&str>) {
          /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>"
             .to_string(),
         "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string(),
-        format!("<< /Length {} >>\nstream\n{content}endstream", content.len()),
+        format!(
+            "<< /Length {} >>\nstream\n{content}endstream",
+            content.len()
+        ),
         info,
     ];
     let mut pdf = String::from("%PDF-1.4\n");
@@ -263,17 +271,48 @@ fn main() {
         .map(|p| p.replace("3,200만 원", "3,500만 원"))
         .collect();
     let edited: Vec<&str> = edited.iter().map(|s| s.as_str()).collect();
-    write_docx(&dir.join("제안서.docx"), PROPOSAL, "2026-08-01T09:00:00Z", 3);
-    write_docx(&dir.join("제안서_재저장.docx"), PROPOSAL, "2026-08-04T09:00:00Z", 9);
-    write_docx(&dir.join("제안서_최종.docx"), &edited, "2026-08-05T09:00:00Z", 12);
+    write_docx(
+        &dir.join("제안서.docx"),
+        PROPOSAL,
+        "2026-08-01T09:00:00Z",
+        3,
+    );
+    write_docx(
+        &dir.join("제안서_재저장.docx"),
+        PROPOSAL,
+        "2026-08-04T09:00:00Z",
+        9,
+    );
+    write_docx(
+        &dir.join("제안서_최종.docx"),
+        &edited,
+        "2026-08-05T09:00:00Z",
+        12,
+    );
 
     // Family 2: hwpx identical copies.
     write_hwpx(&dir.join("보고서.hwpx"), MINUTES, "2026-08-02T09:00:00Z");
-    write_hwpx(&dir.join("보고서 사본.hwpx"), MINUTES, "2026-08-03T09:00:00Z");
+    write_hwpx(
+        &dir.join("보고서 사본.hwpx"),
+        MINUTES,
+        "2026-08-03T09:00:00Z",
+    );
 
     // Family 3: pdf one-line edit (ASCII text for the Type1 font).
-    let v1 = ["Weekly sync notes", "Pilot starts Oct 20", "Budget burn 62 percent", "File naming rule due next week", "Action items in the tracker"];
-    let v2 = ["Weekly sync notes", "Pilot starts Oct 27", "Budget burn 62 percent", "File naming rule due next week", "Action items in the tracker"];
+    let v1 = [
+        "Weekly sync notes",
+        "Pilot starts Oct 20",
+        "Budget burn 62 percent",
+        "File naming rule due next week",
+        "Action items in the tracker",
+    ];
+    let v2 = [
+        "Weekly sync notes",
+        "Pilot starts Oct 27",
+        "Budget burn 62 percent",
+        "File naming rule due next week",
+        "Action items in the tracker",
+    ];
     write_pdf(&dir.join("minutes.pdf"), &v1, Some("D:20260803090000Z"));
     write_pdf(&dir.join("minutes_v2.pdf"), &v2, Some("D:20260806090000Z"));
 
@@ -316,29 +355,88 @@ fn main() {
     write_hwp(&dir.join("운영계획_최종.hwp"), &hwp_v2);
 
     // Family 6: pptx identical slides, different internal timestamps.
-    let slides = ["분기 실적 발표", "매출 12억, 전분기 대비 8퍼센트 증가", "다음 분기 목표와 리스크"];
+    let slides = [
+        "분기 실적 발표",
+        "매출 12억, 전분기 대비 8퍼센트 증가",
+        "다음 분기 목표와 리스크",
+    ];
     write_pptx(&dir.join("발표자료.pptx"), &slides, "2026-08-01T09:00:00Z");
-    write_pptx(&dir.join("발표자료_복사본.pptx"), &slides, "2026-08-02T09:00:00Z");
+    write_pptx(
+        &dir.join("발표자료_복사본.pptx"),
+        &slides,
+        "2026-08-02T09:00:00Z",
+    );
 
     // Family 7: xlsx one-cell edit.
     let strings = [
-        "항목", "금액", "인건비", "1,200", "서버비", "340", "라이선스", "210",
-        "광고비", "480", "비품", "95", "회의비", "60", "1,350",
-        "택배비", "42", "도서구입", "38", "소모품", "27", "통신비", "88",
-        "수수료", "15", "복리후생", "120", "교통비", "76",
+        "항목",
+        "금액",
+        "인건비",
+        "1,200",
+        "서버비",
+        "340",
+        "라이선스",
+        "210",
+        "광고비",
+        "480",
+        "비품",
+        "95",
+        "회의비",
+        "60",
+        "1,350",
+        "택배비",
+        "42",
+        "도서구입",
+        "38",
+        "소모품",
+        "27",
+        "통신비",
+        "88",
+        "수수료",
+        "15",
+        "복리후생",
+        "120",
+        "교통비",
+        "76",
     ];
     let rows_v1: Vec<&[usize]> = vec![
-        &[0, 1], &[2, 3], &[4, 5], &[6, 7], &[8, 9], &[10, 11], &[12, 13],
-        &[14, 15], &[16, 17], &[18, 19], &[20, 21], &[22, 23], &[24, 25], &[26, 27],
+        &[0, 1],
+        &[2, 3],
+        &[4, 5],
+        &[6, 7],
+        &[8, 9],
+        &[10, 11],
+        &[12, 13],
+        &[14, 15],
+        &[16, 17],
+        &[18, 19],
+        &[20, 21],
+        &[22, 23],
+        &[24, 25],
+        &[26, 27],
     ];
     let mut v2_flat: Vec<Vec<usize>> = rows_v1.iter().map(|r| r.to_vec()).collect();
     v2_flat[1][1] = 14;
     let rows_v2: Vec<&[usize]> = v2_flat.iter().map(|r| r.as_slice()).collect();
-    write_xlsx(&dir.join("예산표.xlsx"), &strings, &rows_v1, "2026-08-01T09:00:00Z");
-    write_xlsx(&dir.join("예산표_v2.xlsx"), &strings, &rows_v2, "2026-08-04T09:00:00Z");
+    write_xlsx(
+        &dir.join("예산표.xlsx"),
+        &strings,
+        &rows_v1,
+        "2026-08-01T09:00:00Z",
+    );
+    write_xlsx(
+        &dir.join("예산표_v2.xlsx"),
+        &strings,
+        &rows_v2,
+        "2026-08-04T09:00:00Z",
+    );
 
     // Unrelated doc and a scanned-style PDF (no embedded text).
-    std::fs::write(dir.join("메모.txt"), "오늘 점심은 김치찌개다. 산책을 하고 일찍 잔다.").unwrap();
+    std::fs::write(
+        dir.join("메모.txt"),
+        "오늘 점심은 김치찌개다. 산책을 하고 일찍 잔다.",
+    )
+    .unwrap();
     std::fs::write(dir.join("scan.pdf"), b"%PDF-1.4\n").unwrap(); // broken/empty on purpose
 
     // Filler docs for benchmarks: unique per-doc tokens (no shared
@@ -348,7 +446,12 @@ fn main() {
     // covered by the named fixtures above.
     fn synth_doc(seed: usize) -> String {
         (0..8)
-            .map(|k| format!("근거{seed:06}에따라절차{:06}를정리하고담당확인을남긴다", seed.wrapping_mul(8 + k) % 100000))
+            .map(|k| {
+                format!(
+                    "근거{seed:06}에따라절차{:06}를정리하고담당확인을남긴다",
+                    seed.wrapping_mul(8 + k) % 100000
+                )
+            })
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -359,11 +462,20 @@ fn main() {
             1 => std::fs::write(dir.join(format!("filler_{i:04}.md")), body).unwrap(),
             2 => {
                 let paras: Vec<&str> = body.lines().collect();
-                write_docx(&dir.join(format!("filler_{i:04}.docx")), &paras, "2026-08-01T00:00:00Z", 1)
+                write_docx(
+                    &dir.join(format!("filler_{i:04}.docx")),
+                    &paras,
+                    "2026-08-01T00:00:00Z",
+                    1,
+                )
             }
             _ => {
                 let paras: Vec<&str> = body.lines().collect();
-                write_hwpx(&dir.join(format!("filler_{i:04}.hwpx")), &paras, "2026-08-01T00:00:00Z")
+                write_hwpx(
+                    &dir.join(format!("filler_{i:04}.hwpx")),
+                    &paras,
+                    "2026-08-01T00:00:00Z",
+                )
             }
         }
     }
