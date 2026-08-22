@@ -151,6 +151,8 @@ jobs:
         env:
           RELEASE_VERSION: ${{ inputs.version }}
         run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           tag="v${RELEASE_VERSION}"
           git tag -a "$tag" -m "dupey ${RELEASE_VERSION}"
           git push origin "$tag"
