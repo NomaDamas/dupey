@@ -34,7 +34,8 @@ Latest pick inside a family is **modified time only** (internal document time be
 
 ```bash
 cargo test --workspace            # unit + integration (real binary, real fixtures)
-./scripts/e2e.sh                  # live e2e on generated docx/hwpx/pdf corpus
+python scripts/e2e.py              # cross-platform live e2e (Linux/macOS/Windows)
+./scripts/e2e.sh                  # Unix convenience wrapper
 cargo bench -p dupey-core         # criterion: extract / near_sig / cluster
 ./scripts/bench.sh 10             # corpus scan benchmark (10 x 100 files)
 ```
