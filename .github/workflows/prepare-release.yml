@@ -78,7 +78,7 @@ jobs:
           fi
 
           for package in dupey-core dupey; do
-            if cargo info "${package}@${RELEASE_VERSION}" >/dev/null 2>&1; then
+            if cargo info --registry crates-io "${package}@${RELEASE_VERSION}" >/dev/null 2>&1; then
               echo "${package} ${RELEASE_VERSION} is already published."
               exit 1
             fi
