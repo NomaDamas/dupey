@@ -13,9 +13,12 @@ pub mod rank;
 pub use error::{Error, Result};
 pub use exact::{byte_hash, byte_hash_hex, exact_hash, exact_hash_hex};
 pub use extract::{extract, CanonicalText, DocMeta, Format};
-pub use family::{cluster, Family, FamilyMember, Relation, ScannedDoc};
+pub use family::{
+    cluster, ClusterConfig, Family, FamilyEdge, FamilyLabel, FamilyMember, Relation, ScannedDoc,
+};
 pub use near::{
-    containment, containment_at_least, exact_jaccard, near_sig, score, shingles, NearSignature,
+    containment, containment_at_least, exact_jaccard, near_sig, overlap, overlap_at_least, score,
+    shingles, NearSignature, Overlap, DEFAULT_CONTAINS_MIN_JACCARD, DEFAULT_CONTAINS_THRESHOLD,
     DEFAULT_NEAR_THRESHOLD, MINHASH_CANDIDATE_THRESHOLD, NUM_PERM,
 };
 pub use rank::{rank, FamilyRanking, MemberSignals, RankSignal, RankedMember};

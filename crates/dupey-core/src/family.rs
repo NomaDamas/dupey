@@ -1,15 +1,21 @@
 //! Cluster documents into families (exact / near / contains).
 //!
 //! exact groups by SHA-256 of canonical text, near uses LSH over MinHash
-//! candidates and exact shingle Jaccard at the family threshold (default 0.90), contains uses
-//! shingle containment for the draft-inside-final case. Documents with no
-//! comparable text only cluster when their original bytes are exact matches.
+//! candidates verified with exact shingle Jaccard at the near threshold
+//! (default 0.90), contains uses shingle containment at its own, stricter
+//! threshold (default 0.96) for the draft-inside-final case. Both relations
+//! are computed for every candidate pair, and every verified pair is kept as
+//! a [`FamilyEdge`] so callers can see why a family exists instead of being
+//! handed a single collapsed label. Documents with no comparable text only
+//! cluster when their original bytes are exact matches.
 
 use std::path::PathBuf;
 
+use rayon::prelude::*;
+
 use crate::near::{
-    containment, containment_at_least, exact_jaccard, near_sig, score, shingles, NearSignature,
-    MINHASH_CANDIDATE_THRESHOLD,
+    near_sig, overlap_at_least, score, shingles, NearSignature, DEFAULT_CONTAINS_MIN_JACCARD,
+    DEFAULT_CONTAINS_THRESHOLD, DEFAULT_NEAR_THRESHOLD, MINHASH_CANDIDATE_THRESHOLD,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -20,16 +26,49 @@ pub enum Relation {
     Contains,
 }
 
+/// How a whole family holds together.
+///
+/// `Mixed` exists so a family that is part near and part contains is never
+/// folded into whichever label happens to win a priority list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FamilyLabel {
+    Exact,
+    Near,
+    Contains,
+    Mixed,
+}
+
+/// One verified pair inside a family: the evidence that produced a merge.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct FamilyEdge {
+    pub relation: Relation,
+    /// For `contains`, the container. Otherwise the lower-indexed document.
+    pub a: PathBuf,
+    /// For `contains`, the document living inside `a`.
+    pub b: PathBuf,
+    /// MinHash Jaccard estimate for the pair.
+    pub near_score: f64,
+    /// Exact shingle Jaccard for the pair.
+    pub jaccard: f64,
+    /// `|a ∩ b| / |b|`: how much of `b` lives inside `a`.
+    pub containment: f64,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FamilyMember {
     pub path: PathBuf,
     pub exact_hash: String,
+    /// Relation of this member's strongest verified edge: how it actually
+    /// joined the family, never a fallback guess.
     pub relation: Relation,
-    /// MinHash Jaccard estimate against the family anchor.
+    /// The other endpoint of that edge.
+    pub joined_with: Option<PathBuf>,
+    /// MinHash Jaccard estimate against `joined_with`.
     pub near_score: Option<f64>,
-    /// Exact shingle Jaccard against the family anchor, when computed.
+    /// Exact shingle Jaccard against `joined_with`.
     pub jaccard: Option<f64>,
-    /// Shingle containment against the family anchor, when computed.
+    /// Shingle containment against `joined_with`.
     pub containment: Option<f64>,
 }
 
@@ -37,6 +76,66 @@ pub struct FamilyMember {
 pub struct Family {
     pub id: u32,
     pub members: Vec<FamilyMember>,
+    /// Every verified pair in this family, in stable path order.
+    pub edges: Vec<FamilyEdge>,
+}
+
+impl Family {
+    /// The family-wide relation, or `Mixed` when members joined differently.
+    pub fn label(&self) -> FamilyLabel {
+        let mut relations = self.members.iter().map(|m| m.relation);
+        let first = match relations.next() {
+            Some(r) => r,
+            None => return FamilyLabel::Mixed,
+        };
+        if relations.any(|r| r != first) {
+            return FamilyLabel::Mixed;
+        }
+        match first {
+            Relation::Exact => FamilyLabel::Exact,
+            Relation::Near => FamilyLabel::Near,
+            Relation::Contains => FamilyLabel::Contains,
+        }
+    }
+}
+
+/// Thresholds for [`cluster`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ClusterConfig {
+    /// Exact shingle Jaccard required for a `near` merge.
+    pub near_threshold: f64,
+    /// Shingle containment required for a `contains` merge. Kept separate
+    /// from `near_threshold` because containment divides by the smaller
+    /// document and is therefore much easier to satisfy.
+    pub contains_threshold: f64,
+    /// Jaccard floor a `contains` pair must also clear.
+    ///
+    /// Containment alone says nothing about size: a two-page fragment is
+    /// fully "contained" in a fifty-page report it shares a header with.
+    /// Left unbounded, such fragments bridge unrelated documents into one
+    /// enormous component. The floor keeps contains to pairs that are still
+    /// substantially the same document.
+    pub contains_min_jaccard: f64,
+}
+
+impl Default for ClusterConfig {
+    fn default() -> Self {
+        Self {
+            near_threshold: DEFAULT_NEAR_THRESHOLD,
+            contains_threshold: DEFAULT_CONTAINS_THRESHOLD,
+            contains_min_jaccard: DEFAULT_CONTAINS_MIN_JACCARD,
+        }
+    }
+}
+
+impl ClusterConfig {
+    pub fn new(near_threshold: f64, contains_threshold: f64) -> Self {
+        Self {
+            near_threshold,
+            contains_threshold,
+            ..Self::default()
+        }
+    }
 }
 
 /// Bottom-k sketch width: k smallest shingle hashes per document.
@@ -99,10 +198,15 @@ impl ScannedDoc {
 
 /// Group comparable documents into families of 2+ members.
 ///
-/// LSH runs at a loose MinHash candidate threshold (0.8), then near pairs
-/// are verified with exact shingle Jaccard. Contains candidates need the
-/// threshold: a draft inside a final can sit at Jaccard 0.5-0.7.
-pub fn cluster(docs: &[ScannedDoc], threshold: f64) -> Vec<Family> {
+/// LSH runs at a loose MinHash candidate threshold (0.8) and a bottom-k
+/// sketch index covers containment candidates LSH bands cannot see. Every
+/// candidate is then verified in parallel: one merge intersect yields the
+/// exact Jaccard and both containment directions at once, so near and
+/// contains are always both evaluated for the same pair. Verified pairs are
+/// unioned sequentially in sorted order, which keeps the result identical
+/// run to run regardless of how the work was scheduled.
+pub fn cluster(docs: &[ScannedDoc], config: &ClusterConfig) -> Vec<Family> {
+    let threshold = config.near_threshold;
     let candidate_threshold = MINHASH_CANDIDATE_THRESHOLD.min(threshold);
     // gaoya requires bands x width == signature length (128). 16x8
     // retrieves a MinHash-0.8 pair with ~94.7% probability while
@@ -175,7 +279,7 @@ pub fn cluster(docs: &[ScannedDoc], threshold: f64) -> Vec<Family> {
         for &h in &docs[i].sketch {
             if let Some(posting) = sketch_postings.get(&h) {
                 for &j in posting {
-                    // Skip pairs already unioned by LSH/exact; popular
+                    // Skip pairs already unioned as exact copies; popular
                     // sketch values otherwise make candidate collection
                     // quadratic on template-heavy corpora.
                     if j != i && uf.find(i) != uf.find(j) {
@@ -186,41 +290,57 @@ pub fn cluster(docs: &[ScannedDoc], threshold: f64) -> Vec<Family> {
         }
     }
 
-    for (i, j) in candidates {
-        if uf.find(i) == uf.find(j) {
-            continue;
-        }
-        let s = score(&docs[i].sig, &docs[j].sig);
-        if s >= candidate_threshold
-            && exact_jaccard(&docs[i].shingles, &docs[j].shingles) >= threshold
-        {
-            uf.union(i, j);
-            continue;
-        }
-        // Cheap necessary conditions before the merge intersect:
-        // containment(b in a) >= t needs |a| >= t|b| and, since matching
-        // minima land in both signatures, a MinHash estimate at least
-        // ~t. The 0.1/0.2 slack covers 128-perm estimation error; the
-        // full intersect decides.
-        let (la, lb) = (docs[i].shingles.len() as f64, docs[j].shingles.len() as f64);
-        if la >= threshold * lb
-            && s + 0.1 >= threshold * lb / (la + lb - threshold * lb)
-            && s >= threshold - 0.5
-        {
-            let c = containment_at_least(&docs[i].shingles, &docs[j].shingles, threshold);
-            if c >= threshold {
-                uf.union(i, j);
-                continue;
+    let candidates: Vec<(usize, usize)> = candidates.into_iter().collect();
+
+    let mut edges: Vec<VerifiedEdge> = Vec::new();
+    for &i in &comp {
+        // Exact copies are evidence too: record them so every member of an
+        // exact family can point at the twin it matched.
+        if let Some(group) = by_hash.get(docs[i].exact_hash.as_str()) {
+            if group[0] != i {
+                edges.push(VerifiedEdge::exact(group[0], i));
             }
         }
-        if lb >= threshold * la
-            && s + 0.1 >= threshold * la / (la + lb - threshold * la)
-            && s >= threshold - 0.5
-        {
-            let c = containment_at_least(&docs[j].shingles, &docs[i].shingles, threshold);
-            if c >= threshold {
-                uf.union(i, j);
-            }
+    }
+    // Byte-identical files with no comparable text are exact duplicates as
+    // well, and their members need the same evidence trail.
+    for group in by_byte_hash.values() {
+        for &i in &group[1..] {
+            edges.push(VerifiedEdge::exact(group[0], i));
+        }
+    }
+
+    // Verification is the expensive stage and pairs are independent, so a
+    // chunk of candidates is verified in parallel and then unioned
+    // sequentially in sorted order. Chunking keeps the sequential loop's
+    // best optimisation -- skipping pairs already joined by an earlier
+    // merge -- while still filling every core. Chunk size is a constant and
+    // the candidate list is sorted, so the outcome never depends on thread
+    // scheduling or on how many threads rayon happens to use.
+    const VERIFY_CHUNK: usize = 512;
+    // A merge intersect costs about one pass over both shingle vectors.
+    // Below this much total work, rayon's fork/join costs more than the
+    // comparisons it spreads out, so short documents stay on one thread.
+    const PARALLEL_MIN_WORK: usize = 1 << 20;
+    for chunk in candidates.chunks(VERIFY_CHUNK) {
+        let pending: Vec<(usize, usize)> = chunk
+            .iter()
+            .copied()
+            .filter(|&(i, j)| uf.find(i) != uf.find(j))
+            .collect();
+        let work: usize = pending
+            .iter()
+            .map(|&(i, j)| docs[i].shingles.len() + docs[j].shingles.len())
+            .sum();
+        let verify = |&(i, j): &(usize, usize)| verify_pair(docs, i, j, config);
+        let verified: Vec<Option<VerifiedEdge>> = if work >= PARALLEL_MIN_WORK {
+            pending.par_iter().map(verify).collect()
+        } else {
+            pending.iter().map(verify).collect()
+        };
+        for edge in verified.into_iter().flatten() {
+            uf.union(edge.a, edge.b);
+            edges.push(edge);
         }
     }
 
@@ -235,65 +355,191 @@ pub fn cluster(docs: &[ScannedDoc], threshold: f64) -> Vec<Family> {
     let mut groups: Vec<Vec<usize>> = components.into_values().filter(|g| g.len() >= 2).collect();
     groups.sort_by_key(|g| g[0]);
 
-    groups
+    // Bucket edges by family in one pass: scanning every edge per family
+    // would be quadratic on corpora with many families.
+    let mut family_of: Vec<Option<usize>> = vec![None; docs.len()];
+    for (id, group) in groups.iter().enumerate() {
+        for &i in group {
+            family_of[i] = Some(id);
+        }
+    }
+    let mut edges_by_family: Vec<Vec<VerifiedEdge>> = vec![Vec::new(); groups.len()];
+    for edge in &edges {
+        if let Some(id) = family_of[edge.a].or(family_of[edge.b]) {
+            edges_by_family[id].push(*edge);
+        }
+    }
+
+    let mut families: Vec<Family> = groups
         .into_iter()
+        .zip(edges_by_family)
         .enumerate()
-        .map(|(id, group)| {
-            let anchor = group[0];
+        .map(|(id, (group, mut family_edges))| {
+            family_edges.sort_by(|x, y| {
+                edge_rank(y)
+                    .partial_cmp(&edge_rank(x))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| (x.a, x.b).cmp(&(y.a, y.b)))
+            });
             let members = group
                 .iter()
-                .map(|&i| member_against_anchor(docs, i, anchor, threshold, candidate_threshold))
+                .map(|&i| member_from_edges(docs, i, &family_edges))
                 .collect();
             Family {
                 id: id as u32,
                 members,
+                edges: family_edges.iter().map(|e| e.materialize(docs)).collect(),
             }
         })
-        .collect()
+        .collect();
+    families.sort_by_key(|f| f.id);
+    families
 }
 
-/// Explainable per-member relation against the family anchor.
-fn member_against_anchor(
+/// Verify one candidate pair against both relations.
+///
+/// A single merge intersect produces Jaccard and both containment
+/// directions, so near and contains are always evaluated together and the
+/// pair is described by whichever relation it actually satisfies.
+fn verify_pair(
     docs: &[ScannedDoc],
     i: usize,
-    anchor: usize,
-    threshold: f64,
-    candidate_threshold: f64,
-) -> FamilyMember {
-    let byte_exact = !docs[i].comparable()
-        && !docs[anchor].comparable()
-        && docs[i].byte_hash.is_some()
-        && docs[i].byte_hash == docs[anchor].byte_hash;
-    if i == anchor || docs[i].exact_hash == docs[anchor].exact_hash || byte_exact {
-        return FamilyMember {
+    j: usize,
+    config: &ClusterConfig,
+) -> Option<VerifiedEdge> {
+    if docs[i].exact_hash == docs[j].exact_hash {
+        // Already covered by an exact edge; a second near edge for the same
+        // pair would be duplicate evidence.
+        return None;
+    }
+    let (a, b) = (&docs[i].shingles, &docs[j].shingles);
+    // Smallest intersection that could satisfy either relation:
+    //   jaccard  = s / (|a| + |b| - s) >= t   <=>  s >= t(|a| + |b|) / (1 + t)
+    //   contains = s / min(|a|, |b|)   >= c   <=>  s >= c * min(|a|, |b|)
+    // and contains additionally has to clear the Jaccard floor. Anything
+    // below both relations' floors is not a family under any label, so the
+    // intersect can stop as soon as it becomes unreachable.
+    let total = (a.len() + b.len()) as f64;
+    let jaccard_floor = |t: f64| t * total / (1.0 + t);
+    let near_floor = jaccard_floor(config.near_threshold);
+    let contains_floor = (config.contains_threshold * a.len().min(b.len()) as f64)
+        .max(jaccard_floor(config.contains_min_jaccard));
+    let min_shared = near_floor.min(contains_floor).ceil().max(0.0) as usize;
+    let stats = overlap_at_least(a, b, min_shared)?;
+    let near_score = score(&docs[i].sig, &docs[j].sig);
+    if stats.jaccard >= config.near_threshold {
+        return Some(VerifiedEdge {
+            relation: Relation::Near,
+            a: i,
+            b: j,
+            near_score,
+            jaccard: stats.jaccard,
+            containment: stats.max_containment(),
+        });
+    }
+    if stats.max_containment() >= config.contains_threshold
+        && stats.jaccard >= config.contains_min_jaccard
+    {
+        // b_in_a means every shingle of j sits inside i: i is the container.
+        let (container, contained) = if stats.b_in_a >= stats.a_in_b {
+            (i, j)
+        } else {
+            (j, i)
+        };
+        return Some(VerifiedEdge {
+            relation: Relation::Contains,
+            a: container,
+            b: contained,
+            near_score,
+            jaccard: stats.jaccard,
+            containment: stats.max_containment(),
+        });
+    }
+    None
+}
+
+/// A verified pair while clustering: document indices, not paths, so the hot
+/// loops compare and sort integers instead of cloning path buffers.
+#[derive(Debug, Clone, Copy)]
+struct VerifiedEdge {
+    relation: Relation,
+    a: usize,
+    b: usize,
+    near_score: f64,
+    jaccard: f64,
+    containment: f64,
+}
+
+impl VerifiedEdge {
+    fn exact(i: usize, j: usize) -> Self {
+        Self {
+            relation: Relation::Exact,
+            a: i,
+            b: j,
+            near_score: 1.0,
+            jaccard: 1.0,
+            containment: 1.0,
+        }
+    }
+
+    fn touches(&self, i: usize) -> bool {
+        self.a == i || self.b == i
+    }
+
+    fn other(&self, i: usize) -> usize {
+        if self.a == i {
+            self.b
+        } else {
+            self.a
+        }
+    }
+
+    fn materialize(&self, docs: &[ScannedDoc]) -> FamilyEdge {
+        FamilyEdge {
+            relation: self.relation,
+            a: docs[self.a].path.clone(),
+            b: docs[self.b].path.clone(),
+            near_score: self.near_score,
+            jaccard: self.jaccard,
+            containment: self.containment,
+        }
+    }
+}
+
+/// Evidence strength: exact beats near beats contains, then score.
+fn edge_rank(edge: &VerifiedEdge) -> f64 {
+    let base = match edge.relation {
+        Relation::Exact => 2.0,
+        Relation::Near => 1.0,
+        Relation::Contains => 0.0,
+    };
+    base + edge.jaccard.max(edge.containment)
+}
+
+/// Describe a member by its strongest verified edge instead of guessing a
+/// relation against an anchor it may never have been compared with.
+fn member_from_edges(docs: &[ScannedDoc], i: usize, edges: &[VerifiedEdge]) -> FamilyMember {
+    // `edges` is pre-sorted strongest first, so the first incident edge is
+    // this member's best evidence.
+    match edges.iter().find(|e| e.touches(i)) {
+        Some(edge) => FamilyMember {
             path: docs[i].path.clone(),
             exact_hash: docs[i].exact_hash.clone(),
-            relation: Relation::Exact,
-            near_score: Some(1.0),
-            jaccard: Some(1.0),
-            containment: Some(1.0),
-        };
-    }
-    let s = score(&docs[i].sig, &docs[anchor].sig);
-    let jaccard = Some(exact_jaccard(&docs[i].shingles, &docs[anchor].shingles));
-    let c_in = containment(&docs[anchor].shingles, &docs[i].shingles);
-    let c_out = containment(&docs[i].shingles, &docs[anchor].shingles);
-    let c = c_in.max(c_out);
-    let relation = if s >= candidate_threshold && jaccard.is_some_and(|value| value >= threshold) {
-        Relation::Near
-    } else if c >= threshold {
-        Relation::Contains
-    } else {
-        // Joined transitively through another member.
-        Relation::Near
-    };
-    FamilyMember {
-        path: docs[i].path.clone(),
-        exact_hash: docs[i].exact_hash.clone(),
-        relation,
-        near_score: Some(s),
-        jaccard,
-        containment: Some(c),
+            relation: edge.relation,
+            joined_with: Some(docs[edge.other(i)].path.clone()),
+            near_score: Some(edge.near_score),
+            jaccard: Some(edge.jaccard),
+            containment: Some(edge.containment),
+        },
+        None => FamilyMember {
+            path: docs[i].path.clone(),
+            exact_hash: docs[i].exact_hash.clone(),
+            relation: Relation::Near,
+            joined_with: None,
+            near_score: None,
+            jaccard: None,
+            containment: None,
+        },
     }
 }
 
@@ -326,7 +572,9 @@ impl UnionFind {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::near::{exact_jaccard, score, DEFAULT_NEAR_THRESHOLD, MINHASH_CANDIDATE_THRESHOLD};
+    use crate::near::{
+        containment, exact_jaccard, score, DEFAULT_NEAR_THRESHOLD, MINHASH_CANDIDATE_THRESHOLD,
+    };
     use std::path::Path;
 
     fn doc(name: &str, text: &str) -> ScannedDoc {
@@ -348,11 +596,211 @@ mod tests {
             .join("\n")
     }
 
+    /// Deterministic pseudo-text with no shared template vocabulary.
+    /// Two different seeds share almost no character 5-grams, which lets a
+    /// test dial containment by mixing a shared block with unique bodies.
+    fn noise(seed: u64, lines: usize) -> String {
+        const SYLLABLES: &[char] = &[
+            '가', '나', '다', '라', '마', '바', '사', '아', '자', '차', '카', '타', '파', '하',
+            '거', '너', '더', '러', '머', '버', '서', '어', '저', '처', '커', '터', '퍼', '허',
+        ];
+        let mut state = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(7);
+        let mut out = String::new();
+        for _ in 0..lines {
+            for _ in 0..40 {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                out.push(SYLLABLES[(state >> 33) as usize % SYLLABLES.len()]);
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    /// `n` documents that share one boilerplate block and differ only in a
+    /// short unique body: the corporate-template shape from issue #3.
+    fn template_siblings(n: usize, shared_lines: usize, body_lines: usize) -> Vec<ScannedDoc> {
+        let boilerplate = noise(1, shared_lines);
+        (0..n)
+            .map(|i| {
+                doc(
+                    &format!("양식_{i}.docx"),
+                    &format!("{boilerplate}{}", noise(100 + i as u64, body_lines)),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn contains_threshold_is_separate_from_near_threshold() {
+        let docs = template_siblings(2, 93, 7);
+        let observed = containment(&docs[0].shingles, &docs[1].shingles)
+            .max(containment(&docs[1].shingles, &docs[0].shingles));
+        assert!(
+            (DEFAULT_NEAR_THRESHOLD..DEFAULT_CONTAINS_THRESHOLD).contains(&observed),
+            "fixture must land between the two thresholds, got {observed}"
+        );
+
+        assert!(
+            cluster(&docs, &ClusterConfig::default()).is_empty(),
+            "shared-template siblings must not pass the stricter contains gate"
+        );
+
+        let permissive = ClusterConfig {
+            contains_threshold: DEFAULT_NEAR_THRESHOLD,
+            ..ClusterConfig::default()
+        };
+        assert_eq!(
+            cluster(&docs, &permissive).len(),
+            1,
+            "the same pair merges once contains uses the near threshold"
+        );
+    }
+
+    #[test]
+    fn template_siblings_do_not_form_one_family() {
+        // Issue #3: eight distinct API manuals on one corporate template.
+        let docs = template_siblings(8, 93, 7);
+        let families = cluster(&docs, &ClusterConfig::default());
+        assert!(
+            families.is_empty(),
+            "expected no family, got {:?}",
+            families.iter().map(|f| f.members.len()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn plain_addition_still_joins_by_contains() {
+        // Draft wholly inside the final: containment 1.0, the case contains
+        // exists for. A stricter contains threshold must not break it.
+        let draft = noise(7, 40);
+        let final_doc = format!("{draft}{}", noise(8, 40));
+        let docs = vec![doc("초안.docx", &draft), doc("최종.docx", &final_doc)];
+        let families = cluster(&docs, &ClusterConfig::default());
+        assert_eq!(families.len(), 1);
+        assert!(families[0]
+            .members
+            .iter()
+            .any(|m| m.relation == Relation::Contains));
+    }
+
+    #[test]
+    fn family_records_the_edge_that_joined_each_pair() {
+        let draft = noise(7, 40);
+        let final_doc = format!("{draft}{}", noise(8, 40));
+        let docs = vec![doc("초안.docx", &draft), doc("최종.docx", &final_doc)];
+        let families = cluster(&docs, &ClusterConfig::default());
+
+        let edges = &families[0].edges;
+        assert_eq!(edges.len(), 1, "one verified pair means one edge");
+        let edge = &edges[0];
+        assert_eq!(edge.relation, Relation::Contains);
+        assert_eq!(edge.a, PathBuf::from("최종.docx"), "a is the container");
+        assert_eq!(edge.b, PathBuf::from("초안.docx"), "b is the contained");
+        assert!(edge.containment >= DEFAULT_CONTAINS_THRESHOLD);
+        assert!(edge.jaccard < DEFAULT_NEAR_THRESHOLD);
+    }
+
+    #[test]
+    fn member_reports_its_real_evidence_not_a_near_fallback() {
+        // draft ⊂ final joins by contains; an edit of the draft joins by
+        // near. No member may claim `near` without a near-grade Jaccard.
+        let draft = noise(7, 40);
+        let final_doc = format!("{draft}{}", noise(8, 40));
+        let edited = draft.replacen('가', "나", 3);
+        let docs = vec![
+            doc("최종.docx", &final_doc),
+            doc("초안.docx", &draft),
+            doc("초안_수정.docx", &edited),
+        ];
+        let families = cluster(&docs, &ClusterConfig::default());
+        assert_eq!(families.len(), 1);
+        assert_eq!(families[0].members.len(), 3);
+
+        for member in &families[0].members {
+            let joined = member
+                .joined_with
+                .as_ref()
+                .expect("every member of a family has evidence");
+            assert_ne!(joined, &member.path);
+            if member.relation == Relation::Near {
+                assert!(
+                    member.jaccard.unwrap() >= DEFAULT_NEAR_THRESHOLD,
+                    "{} claims near at jaccard {:?}",
+                    member.path.display(),
+                    member.jaccard
+                );
+            }
+        }
+
+        // 최종.docx only ever matched by containment, so that is what it
+        // must report -- with the counterpart named.
+        let container = families[0]
+            .members
+            .iter()
+            .find(|m| m.path == Path::new("최종.docx"))
+            .unwrap();
+        assert_eq!(container.relation, Relation::Contains);
+        assert!(container
+            .joined_with
+            .as_deref()
+            .is_some_and(|p| p.to_string_lossy().starts_with("초안")));
+        assert!(container.containment.unwrap() >= DEFAULT_CONTAINS_THRESHOLD);
+    }
+
+    #[test]
+    fn family_label_is_mixed_when_members_join_differently() {
+        let draft = noise(7, 40);
+        let final_doc = format!("{draft}{}", noise(8, 40));
+        let edited = draft.replacen('가', "나", 3);
+        let docs = vec![
+            doc("최종.docx", &final_doc),
+            doc("초안.docx", &draft),
+            doc("초안_수정.docx", &edited),
+        ];
+        let families = cluster(&docs, &ClusterConfig::default());
+        assert_eq!(families[0].label(), FamilyLabel::Mixed);
+    }
+
+    #[test]
+    fn exact_copies_are_recorded_as_exact_edges() {
+        let t = proposal();
+        let docs = vec![doc("a.docx", &t), doc("b 복사본.docx", &t)];
+        let families = cluster(&docs, &ClusterConfig::default());
+        assert_eq!(families[0].label(), FamilyLabel::Exact);
+        assert_eq!(families[0].edges.len(), 1);
+        assert_eq!(families[0].edges[0].relation, Relation::Exact);
+        assert_eq!(families[0].edges[0].jaccard, 1.0);
+    }
+
+    #[test]
+    fn clustering_is_deterministic_under_parallel_verification() {
+        let mut docs = template_siblings(6, 60, 40);
+        docs.extend([
+            doc("초안.docx", &noise(7, 40)),
+            doc("최종.docx", &format!("{}{}", noise(7, 40), noise(8, 40))),
+        ]);
+        let first = cluster(&docs, &ClusterConfig::default());
+        for _ in 0..8 {
+            let again = cluster(&docs, &ClusterConfig::default());
+            assert_eq!(first.len(), again.len());
+            for (a, b) in first.iter().zip(&again) {
+                assert_eq!(a.id, b.id);
+                let pa: Vec<_> = a.members.iter().map(|m| &m.path).collect();
+                let pb: Vec<_> = b.members.iter().map(|m| &m.path).collect();
+                assert_eq!(pa, pb);
+                assert_eq!(a.edges.len(), b.edges.len());
+                assert_eq!(a.label(), b.label());
+            }
+        }
+    }
+
     #[test]
     fn exact_group() {
         let t = proposal();
         let docs = vec![doc("a.docx", &t), doc("b 복사본.docx", &t)];
-        let fams = cluster(&docs, DEFAULT_NEAR_THRESHOLD);
+        let fams = cluster(&docs, &ClusterConfig::default());
         assert_eq!(fams.len(), 1);
         assert_eq!(fams[0].members.len(), 2);
         assert!(fams[0]
@@ -366,7 +814,7 @@ mod tests {
         let a = proposal();
         let b = a.replace("3,200만 원", "3,500만 원");
         let docs = vec![doc("제안서.docx", &a), doc("제안서_최종.docx", &b)];
-        let fams = cluster(&docs, DEFAULT_NEAR_THRESHOLD);
+        let fams = cluster(&docs, &ClusterConfig::default());
         assert_eq!(fams.len(), 1);
         let near = fams[0]
             .members
@@ -400,7 +848,7 @@ mod tests {
             .expect("fixture should expose a MinHash false negative near the threshold");
 
         let docs = vec![base_doc, doc("final.hwp", &variant_text)];
-        let families = cluster(&docs, DEFAULT_NEAR_THRESHOLD);
+        let families = cluster(&docs, &ClusterConfig::default());
         assert_eq!(families.len(), 1);
         let near = families[0]
             .members
@@ -424,7 +872,7 @@ mod tests {
         // judgment must still use the complete shingle sets.
         candidate.sig = base_doc.sig.clone();
         let docs = vec![base_doc, candidate];
-        let families = cluster(&docs, DEFAULT_NEAR_THRESHOLD);
+        let families = cluster(&docs, &ClusterConfig::default());
         assert_eq!(families.len(), 1);
         let member = families[0]
             .members
@@ -454,7 +902,7 @@ mod tests {
             doc("보고서_초안.docx", &draft),
             doc("보고서_최종.docx", &final_doc),
         ];
-        let fams = cluster(&docs, DEFAULT_NEAR_THRESHOLD);
+        let fams = cluster(&docs, &ClusterConfig::default());
         assert_eq!(fams.len(), 1, "draft inside final must still be family");
         let contains = fams[0]
             .members
@@ -475,7 +923,7 @@ mod tests {
                 "오늘 점심은 김치찌개다. 오후에는 운동을 하고 책을 읽는다.",
             ),
         ];
-        assert!(cluster(&docs, DEFAULT_NEAR_THRESHOLD).is_empty());
+        assert!(cluster(&docs, &ClusterConfig::default()).is_empty());
     }
 
     #[test]
@@ -498,7 +946,7 @@ mod tests {
                 shingles,
             ),
         ];
-        let fams = cluster(&docs, DEFAULT_NEAR_THRESHOLD);
+        let fams = cluster(&docs, &ClusterConfig::default());
         assert_eq!(fams.len(), 1);
         assert!(fams[0]
             .members
@@ -524,18 +972,56 @@ mod tests {
                 shingles(""),
             ),
         ];
-        assert!(cluster(&docs, DEFAULT_NEAR_THRESHOLD).is_empty());
+        assert!(cluster(&docs, &ClusterConfig::default()).is_empty());
     }
 
     #[test]
     fn transitive_near_merges() {
-        let a = paragraphs("버전", 10);
+        // Long enough that a one-token edit stays above the near threshold:
+        // this test is about transitivity, not about a near-miss pair being
+        // rescued by containment.
+        let a = paragraphs("버전", 40);
         let b = a.replace("1번째", "첫번째");
         let c = b.replace("10번째", "열th");
         let docs = vec![doc("v1.docx", &a), doc("v2.docx", &b), doc("v3.docx", &c)];
-        let fams = cluster(&docs, DEFAULT_NEAR_THRESHOLD);
+        let fams = cluster(&docs, &ClusterConfig::default());
         assert_eq!(fams.len(), 1);
         assert_eq!(fams[0].members.len(), 3);
+    }
+
+    #[test]
+    fn a_shared_fragment_does_not_chain_unrelated_documents() {
+        // A short quoted fragment is fully contained in every long document
+        // that carries it. Containment alone would union them all into one
+        // component; the Jaccard floor keeps them apart.
+        let fragment = noise(50, 4);
+        let docs = vec![
+            doc("조각.txt", &fragment),
+            doc(
+                "보고서_A.pdf",
+                &format!("{}{fragment}{}", noise(11, 60), noise(12, 60)),
+            ),
+            doc(
+                "보고서_B.pdf",
+                &format!("{}{fragment}{}", noise(21, 60), noise(22, 60)),
+            ),
+        ];
+        let overlap = crate::near::overlap(&docs[0].shingles, &docs[1].shingles);
+        assert!(
+            overlap.max_containment() >= DEFAULT_CONTAINS_THRESHOLD,
+            "fixture must be genuinely contained, got {}",
+            overlap.max_containment()
+        );
+        assert!(
+            overlap.jaccard < DEFAULT_CONTAINS_MIN_JACCARD,
+            "fixture must be fragment-scale, got {}",
+            overlap.jaccard
+        );
+
+        assert!(
+            cluster(&docs, &ClusterConfig::default()).is_empty(),
+            "a fragment must not bridge unrelated documents"
+        );
     }
 
     #[test]
@@ -550,7 +1036,7 @@ mod tests {
             final_doc.push_str(&paragraphs(&format!("부록{pool}"), 8));
         }
         let docs = vec![doc("초안.docx", &draft), doc("최종.docx", &final_doc)];
-        let fams = cluster(&docs, DEFAULT_NEAR_THRESHOLD);
+        let fams = cluster(&docs, &ClusterConfig::default());
         assert_eq!(fams.len(), 1, "draft in big final must cluster via sketch");
         assert!(fams[0]
             .members
@@ -609,7 +1095,7 @@ mod tests {
             doc("보고서 사본.docx", &r),
             doc("메모.txt", "내일 회의실 예약하기"),
         ];
-        let fams = cluster(&docs, DEFAULT_NEAR_THRESHOLD);
+        let fams = cluster(&docs, &ClusterConfig::default());
         assert_eq!(fams.len(), 2);
         let mut sizes: Vec<usize> = fams.iter().map(|f| f.members.len()).collect();
         sizes.sort();

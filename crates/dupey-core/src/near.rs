@@ -11,6 +11,22 @@ pub const CHAR_NGRAM: usize = 5;
 
 /// Default Jaccard threshold for treating two docs as one family.
 pub const DEFAULT_NEAR_THRESHOLD: f64 = 0.90;
+/// Default containment threshold for the "draft inside final" relation.
+///
+/// Containment divides by the smaller document, so the same number is a far
+/// weaker bar than Jaccard: a shared corporate template can occupy 90% of a
+/// short document without the two being versions of each other. Contains
+/// therefore gets its own, stricter gate, sized for the plain-addition case
+/// (draft kept verbatim, appendix added) that this relation exists to catch.
+pub const DEFAULT_CONTAINS_THRESHOLD: f64 = 0.96;
+/// Default Jaccard floor a `contains` pair must also clear.
+///
+/// Containment ignores everything outside the smaller document, so without a
+/// floor a short fragment is "contained" in every long document that quotes
+/// it, and those fragments chain unrelated files into one component. At 0.4
+/// the container can still be roughly 2.5x the contained document, which
+/// covers draft-plus-appendix while excluding fragment-scale matches.
+pub const DEFAULT_CONTAINS_MIN_JACCARD: f64 = 0.40;
 /// MinHash estimate required before paying for exact shingle Jaccard.
 pub const MINHASH_CANDIDATE_THRESHOLD: f64 = 0.80;
 
@@ -84,6 +100,80 @@ pub fn exact_jaccard(a: &[u64], b: &[u64]) -> f64 {
 /// |A ∩ B| / |B|: how much of B lives inside A.
 pub fn containment(a: &[u64], b: &[u64]) -> f64 {
     containment_at_least(a, b, 0.0)
+}
+
+/// Every overlap metric for one document pair, from a single merge intersect.
+///
+/// Jaccard and both containment directions share one numerator, so computing
+/// them together costs the same as computing any one of them.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Overlap {
+    pub shared: usize,
+    pub jaccard: f64,
+    /// |A ∩ B| / |B|: how much of B lives inside A.
+    pub b_in_a: f64,
+    /// |A ∩ B| / |A|: how much of A lives inside B.
+    pub a_in_b: f64,
+}
+
+impl Overlap {
+    /// The stronger containment direction.
+    pub fn max_containment(&self) -> f64 {
+        self.b_in_a.max(self.a_in_b)
+    }
+}
+
+/// Compute Jaccard and both containment directions for sorted, deduplicated
+/// shingle hashes in one pass.
+pub fn overlap(a: &[u64], b: &[u64]) -> Overlap {
+    overlap_at_least(a, b, 0).expect("a zero floor is always reachable")
+}
+
+/// [`overlap`] that abandons the intersect once `min_shared` is provably out
+/// of reach.
+///
+/// The remaining shingles on either side cap how much overlap is still
+/// possible, so a pair that cannot clear the caller's floor is dropped
+/// without scanning the rest of either vector. The test is exact: nothing
+/// that could have reached `min_shared` is discarded.
+pub fn overlap_at_least(a: &[u64], b: &[u64], min_shared: usize) -> Option<Overlap> {
+    let mut shared = 0usize;
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < a.len() && j < b.len() {
+        if shared + (a.len() - i).min(b.len() - j) < min_shared {
+            return None;
+        }
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => {
+                shared += 1;
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    if shared < min_shared {
+        return None;
+    }
+    let union = a.len() + b.len() - shared;
+    let ratio = |num: usize, den: usize| {
+        if den == 0 {
+            0.0
+        } else {
+            num as f64 / den as f64
+        }
+    };
+    Some(Overlap {
+        shared,
+        jaccard: if union == 0 {
+            1.0
+        } else {
+            shared as f64 / union as f64
+        },
+        b_in_a: ratio(shared, b.len()),
+        a_in_b: ratio(shared, a.len()),
+    })
 }
 
 /// Merge-intersect containment with early exit once `threshold` becomes

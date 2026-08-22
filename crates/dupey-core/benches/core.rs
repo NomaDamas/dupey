@@ -4,7 +4,7 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-use dupey_core::{cluster, extract, near_sig, score, ScannedDoc};
+use dupey_core::{cluster, extract, near_sig, score, ClusterConfig, ScannedDoc};
 
 fn paragraphs(prefix: &str, n: usize) -> String {
     (1..=n)
@@ -118,7 +118,7 @@ fn bench_cluster(c: &mut Criterion) {
             })
             .collect();
         g.bench_with_input(BenchmarkId::new("docs", n), &docs, |b, docs| {
-            b.iter(|| cluster(docs, 0.90))
+            b.iter(|| cluster(docs, &ClusterConfig::default()))
         });
     }
     g.finish();

@@ -16,11 +16,13 @@ families and an explainable latest candidate.
 - HWPX body-text extraction with internal date metadata
 - PDF embedded-text extraction; image-only scans are reported and excluded
   from comparable families
-- Exact, near (default threshold 0.90), and contains clustering
+- Exact, near (default Jaccard threshold 0.90), and contains (default
+  containment threshold 0.96 with a 0.40 Jaccard floor) clustering
 - LSH candidates using 64 x 2 bands
 - Bottom-k sketch candidates (`k = 64`) for containment involving small
   documents, including a document-frequency filter
-- Candidate verification with size/Jaccard lower bounds and merge-intersection
+- Candidate verification of both relations in one merge-intersection with an
+  exact early exit, run in parallel over candidate chunks
 - Latest-candidate ranking by modification time only: internal timestamp
   first, filesystem timestamp second
 - Stable public contract through `dupey scan DIR --json`
@@ -41,7 +43,9 @@ families and an explainable latest candidate.
 
 ```text
 scan DIR
-  -> families: [{id, files, relation: exact|near|contains}]
+  -> families: [{id, files, relation: exact|near|contains|mixed,
+                 members: [{relation, joined_with, ...}],
+                 edges: [{relation, a, b, near_score, jaccard, containment}]}]
   -> each file: {content_hash, fuzzy, signals}
   -> pick: {ranked, reasons, confidence}
 ```
@@ -67,6 +71,6 @@ extract(path) -> CanonicalText
 exact_hash(text) -> sha256
 near_sig(text) -> minhash
 score(signature_a, signature_b) -> 0.0..1.0
-cluster(documents, threshold) -> families
+cluster(documents, ClusterConfig) -> families
 rank(family, signals) -> ranked candidates with reasons
 ```
