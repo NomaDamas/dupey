@@ -11,6 +11,7 @@ on:
 
 permissions:
   contents: write
+  pull-requests: write
 
 concurrency:
   group: prepare-release
@@ -48,6 +49,7 @@ jobs:
           components: clippy,rustfmt
 
       - name: Validate requested version
+        id: version
         env:
           RELEASE_VERSION: ${{ inputs.version }}
         shell: bash
@@ -60,8 +62,10 @@ jobs:
           current="$(cargo metadata --no-deps --format-version 1 |
             jq -r '[.packages[] | select(.name == "dupey-core")][0].version')"
           if [[ "$RELEASE_VERSION" == "$current" ]]; then
-            echo "Version $RELEASE_VERSION is already the current version."
-            exit 1
+            echo "Version $RELEASE_VERSION is already prepared; continuing to tag it."
+            echo "needs_bump=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "needs_bump=true" >> "$GITHUB_OUTPUT"
           fi
           if [[ "$(printf '%s\n' "$current" "$RELEASE_VERSION" | sort -V | tail -n1)" != "$RELEASE_VERSION" ]]; then
             echo "Version $RELEASE_VERSION must be newer than $current."
@@ -81,6 +85,7 @@ jobs:
           done
 
       - name: Update workspace version
+        if: steps.version.outputs.needs_bump == 'true'
         env:
           RELEASE_VERSION: ${{ inputs.version }}
         shell: bash
@@ -114,6 +119,7 @@ jobs:
           cargo package --locked --allow-dirty -p dupey-core
 
       - name: Commit version bump
+        if: steps.version.outputs.needs_bump == 'true'
         env:
           RELEASE_VERSION: ${{ inputs.version }}
         run: |
@@ -121,9 +127,27 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add Cargo.toml Cargo.lock
           git commit -m "release: prepare dupey ${RELEASE_VERSION}"
-          git push origin HEAD:main
+          branch="release/v${RELEASE_VERSION}"
+          git push origin "HEAD:${branch}"
+          echo "RELEASE_BRANCH=${branch}" >> "$GITHUB_ENV"
+
+      - name: Create version bump pull request
+        if: steps.version.outputs.needs_bump == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ inputs.version }}
+          RELEASE_BRANCH: release/v${{ inputs.version }}
+        run: |
+          gh pr create \
+            --base main \
+            --head "$RELEASE_BRANCH" \
+            --title "release: prepare dupey ${RELEASE_VERSION}" \
+            --body "Automated version bump for dupey ${RELEASE_VERSION}. Merge this PR, then rerun Prepare release for the same version to create the tag and GitHub Release."
+          echo "Version bump PR created; rerun this workflow after it merges."
+          exit 0
 
       - name: Create release tag
+        if: steps.version.outputs.needs_bump == 'false'
         env:
           RELEASE_VERSION: ${{ inputs.version }}
         run: |
@@ -132,6 +156,7 @@ jobs:
           git push origin "$tag"
 
       - name: Create GitHub Release
+        if: steps.version.outputs.needs_bump == 'false'
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_VERSION: ${{ inputs.version }}
