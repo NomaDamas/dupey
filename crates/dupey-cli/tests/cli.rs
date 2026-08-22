@@ -100,6 +100,30 @@ fn unsupported_cjk_pdf() -> Vec<u8> {
     pdf.into_bytes()
 }
 
+fn empty_page_pdf() -> Vec<u8> {
+    let objects = [
+        "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".to_string(),
+    ];
+    let mut pdf = String::from("%PDF-1.4\n");
+    let mut offsets = Vec::new();
+    for (i, body) in objects.iter().enumerate() {
+        offsets.push(pdf.len());
+        pdf.push_str(&format!("{} 0 obj\n{}\nendobj\n", i + 1, body));
+    }
+    let xref_at = pdf.len();
+    let n = objects.len() + 1;
+    pdf.push_str(&format!("xref\n0 {n}\n0000000000 65535 f \n"));
+    for off in offsets {
+        pdf.push_str(&format!("{off:010} 00000 n \n"));
+    }
+    pdf.push_str(&format!(
+        "trailer\n<< /Size {n} /Root 1 0 R >>\nstartxref\n{xref_at}\n%%EOF\n"
+    ));
+    pdf.into_bytes()
+}
+
 const PROPOSAL: &str =
     "프로젝트 제안서\n\n1. 배경\n본 제안은 2026년 하반기 사무 자동화 도입을 위한 것이다. \
      현재 팀은 문서가 폴더에 흩어져 있고 최신본을 찾기 어렵다.\n\n2. 범위\n문서 수집, \
@@ -196,6 +220,25 @@ fn scan_exact_duplicate_group() {
     let families = v["families"].as_array().unwrap();
     assert_eq!(families.len(), 1);
     assert_eq!(families[0]["relation"], "exact");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn scan_groups_byte_identical_empty_pdfs() {
+    let dir = fixture_dir("empty-pdf-exact", &[("scan-a.pdf", "")]);
+    std::fs::write(dir.join("scan-a.pdf"), empty_page_pdf()).unwrap();
+    std::fs::copy(dir.join("scan-a.pdf"), dir.join("scan-b.pdf")).unwrap();
+
+    let v = scan_json(&dir);
+    let families = v["families"].as_array().unwrap();
+    assert_eq!(families.len(), 1, "{v}");
+    assert_eq!(families[0]["relation"], "exact");
+    assert_eq!(families[0]["files"].as_array().unwrap().len(), 2);
+    assert!(v["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|file| file["fuzzy"].is_null()));
     let _ = std::fs::remove_dir_all(&dir);
 }
 

@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use dupey_core::{
-    cluster, containment, exact_hash_hex, extract, near_sig, rank, shingles, CanonicalText, Format,
-    MemberSignals, NearSignature, ScannedDoc, DEFAULT_NEAR_THRESHOLD,
+    byte_hash_hex, cluster, containment, exact_hash_hex, extract, near_sig, rank, shingles,
+    CanonicalText, Format, MemberSignals, NearSignature, ScannedDoc, DEFAULT_NEAR_THRESHOLD,
 };
 use serde::Serialize;
 
@@ -151,6 +151,7 @@ struct PreparedScan {
     canon: CanonicalText,
     fs_mtime: Option<jiff::Timestamp>,
     exact_hash: String,
+    byte_hash: Option<String>,
     sig: NearSignature,
     shingles: Vec<u64>,
     chars: usize,
@@ -187,6 +188,16 @@ fn scan(dir: &Path, json: bool, threshold: f64, extra_exclude: &[String]) -> Res
         .par_iter()
         .map(|path| {
             let canon = extract(path)?;
+            let byte_hash = if canon.text.is_empty() {
+                Some(byte_hash_hex(&std::fs::read(path).map_err(|source| {
+                    dupey_core::Error::Io {
+                        path: path.to_path_buf(),
+                        source,
+                    }
+                })?))
+            } else {
+                None
+            };
             let fs_mtime = std::fs::metadata(path)
                 .and_then(|m| m.modified())
                 .ok()
@@ -201,6 +212,7 @@ fn scan(dir: &Path, json: bool, threshold: f64, extra_exclude: &[String]) -> Res
                 canon,
                 fs_mtime,
                 exact_hash,
+                byte_hash,
                 sig,
                 shingles,
                 chars,
@@ -214,15 +226,17 @@ fn scan(dir: &Path, json: bool, threshold: f64, extra_exclude: &[String]) -> Res
                     canon,
                     fs_mtime,
                     exact_hash,
+                    byte_hash,
                     sig,
                     shingles,
                     chars,
                 } = prepared;
                 let fuzzy = (!canon.text.is_empty()).then(|| sig.values.clone());
+                let content_hash = byte_hash.clone().unwrap_or_else(|| exact_hash.clone());
                 files.push(FileEntry {
                     path: canon.path.display().to_string(),
                     format: canon.format,
-                    content_hash: exact_hash.clone(),
+                    content_hash,
                     fuzzy,
                     signals: FileSignals {
                         chars,
@@ -231,12 +245,18 @@ fn scan(dir: &Path, json: bool, threshold: f64, extra_exclude: &[String]) -> Res
                         fs_mtime: fs_mtime.map(|t| t.to_string()),
                     },
                 });
-                docs.push(ScannedDoc::from_precomputed(
-                    canon.path.clone(),
-                    exact_hash,
-                    sig,
-                    shingles,
-                ));
+                docs.push(match byte_hash {
+                    Some(byte_hash) => ScannedDoc::from_precomputed_with_byte_hash(
+                        canon.path.clone(),
+                        byte_hash.clone(),
+                        byte_hash,
+                        sig,
+                        shingles,
+                    ),
+                    None => {
+                        ScannedDoc::from_precomputed(canon.path.clone(), exact_hash, sig, shingles)
+                    }
+                });
                 metas.push((canon, fs_mtime));
             }
             Err(e) => errors.push(ErrorEntry {
