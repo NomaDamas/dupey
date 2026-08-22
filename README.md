@@ -153,6 +153,18 @@ cargo test --workspace
 See [Contributing](docs/CONTRIBUTING.md), [Direction](docs/DIRECTION.md), and
 [Plan](docs/PLAN.md) for project details.
 
+## Releasing
+
+Maintainers do not edit the version manually. Run the **Prepare release**
+workflow in GitHub Actions and enter the next version without a leading `v`,
+for example `0.1.1`.
+
+The workflow updates the workspace manifest and lockfile, runs the release
+checks, commits and pushes the version bump to `main`, creates the matching
+`v0.1.1` tag and GitHub Release, and starts the OIDC-backed crates.io publish
+workflow. The tag, source commit, GitHub Release, and published packages
+therefore all refer to the same version.
+
 ## License
 
 [MIT](LICENSE)

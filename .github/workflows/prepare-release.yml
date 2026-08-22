@@ -1,0 +1,135 @@
+---
+name: Prepare release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version without the leading v (for example, 0.1.1)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: prepare-release
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Bump, tag, and create release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.91"
+          components: clippy,rustfmt
+
+      - name: Validate requested version
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        shell: bash
+        run: |
+          if [[ ! "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Expected a semantic version such as 0.1.1, without a leading v."
+            exit 1
+          fi
+
+          current="$(cargo metadata --no-deps --format-version 1 |
+            jq -r '[.packages[] | select(.name == "dupey-core")][0].version')"
+          if [[ "$RELEASE_VERSION" == "$current" ]]; then
+            echo "Version $RELEASE_VERSION is already the current version."
+            exit 1
+          fi
+          if [[ "$(printf '%s\n' "$current" "$RELEASE_VERSION" | sort -V | tail -n1)" != "$RELEASE_VERSION" ]]; then
+            echo "Version $RELEASE_VERSION must be newer than $current."
+            exit 1
+          fi
+
+          if git rev-parse --verify --quiet "refs/tags/v${RELEASE_VERSION}"; then
+            echo "Tag v${RELEASE_VERSION} already exists."
+            exit 1
+          fi
+
+          for package in dupey-core dupey; do
+            if cargo info "${package}@${RELEASE_VERSION}" >/dev/null 2>&1; then
+              echo "${package} ${RELEASE_VERSION} is already published."
+              exit 1
+            fi
+          done
+
+      - name: Update workspace version
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          version = os.environ["RELEASE_VERSION"]
+          path = Path("Cargo.toml")
+          text = path.read_text()
+          old = 'version = "'
+          start = text.index(old) + len(old)
+          end = text.index('"', start)
+          text = text[:start] + version + text[end:]
+
+          dependency = 'dupey-core = { path = "crates/dupey-core", version = "'
+          start = text.index(dependency) + len(dependency)
+          end = text.index('"', start)
+          text = text[:start] + version + text[end:]
+          path.write_text(text)
+          PY
+          cargo check --workspace
+
+      - name: Run release checks
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets --all-features -- -D warnings
+          cargo test --workspace --locked
+          cargo build --workspace --release --locked
+          cargo package --locked -p dupey-core
+
+      - name: Commit version bump
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock
+          git commit -m "release: prepare dupey ${RELEASE_VERSION}"
+          git push origin HEAD:main
+
+      - name: Create release tag
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          tag="v${RELEASE_VERSION}"
+          git tag -a "$tag" -m "dupey ${RELEASE_VERSION}"
+          git push origin "$tag"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: gh release create "v${RELEASE_VERSION}" --verify-tag --generate-notes
+
+      - name: Start OIDC publish workflow
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          gh workflow run release.yml \
+            --ref "v${RELEASE_VERSION}" \
+            -f "version=${RELEASE_VERSION}"
