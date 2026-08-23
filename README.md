@@ -29,6 +29,20 @@ cargo install dupey
 
 Requires Rust 1.91 or newer.
 
+## Install the agent skill
+
+If you use a coding agent to review and organize duplicate or near-duplicate
+documents, install the dupey Agent Skill. It teaches the agent how to run
+dupey, interpret `exact`, `near`, `contains`, and `mixed` correctly, and
+prepare a reviewed cleanup plan instead of deleting files from a score alone.
+
+```bash
+npx skills add NomaDamas/dupey
+```
+
+Ask your agent to use the `dupey-document-family` skill before it reorganizes
+document folders.
+
 ## Quick start
 
 ```bash
