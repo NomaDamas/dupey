@@ -6,6 +6,7 @@
 
 pub mod docx;
 pub mod hwp;
+mod hwp3;
 pub mod hwpx;
 pub mod pdf;
 pub mod pptx;

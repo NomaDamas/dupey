@@ -1,6 +1,6 @@
-//! hwp (binary, HWP 5.x) extraction: BodyText paragraph text.
+//! Binary HWP dispatch and HWP 5.x BodyText extraction.
 //!
-//! A .hwp is a CFB (OLE compound file). FileHeader flags tell whether
+//! HWP 3.0 uses a flat binary stream; HWP 5.x uses CFB (OLE). FileHeader flags tell whether
 //! BodyText/SectionN streams are deflate-compressed (they almost always
 //! are). Records are 4-byte headers (tag id, level, size in bytes;
 //! size 0xFFF means an extended 4-byte size follows). Text lives in
@@ -8,7 +8,7 @@
 //! in for tables, fields, and inline objects. Skip their binary payloads,
 //! while retaining displayed field values and nested paragraph text.
 
-use std::io::Read;
+use std::io::{Read, Seek};
 use std::path::Path;
 
 use super::{CanonicalText, DocMeta, Format};
@@ -20,10 +20,20 @@ const FLAG_PASSWORD: u32 = 1 << 1;
 const FLAG_DISTRIBUTABLE: u32 = 1 << 2;
 
 pub(crate) fn extract_hwp(path: &Path) -> Result<CanonicalText> {
-    let file = std::fs::File::open(path).map_err(|source| Error::Io {
+    let mut file = std::fs::File::open(path).map_err(|source| Error::Io {
         path: path.to_path_buf(),
         source,
     })?;
+    let mut signature = [0; 8];
+    file.read_exact(&mut signature)
+        .map_err(|e| extract_err(path, e))?;
+    file.rewind().map_err(|e| extract_err(path, e))?;
+    if &signature == b"HWP Docu" {
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .map_err(|e| extract_err(path, e))?;
+        return super::hwp3::extract_hwp3(path, &bytes);
+    }
     let mut ole = cfb::CompoundFile::open(file).map_err(|e| extract_err(path, e))?;
     let header = read_stream(path, &mut ole, "/FileHeader")?;
     if header.len() < 40 || &header[0..17] != b"HWP Document File" {
@@ -158,7 +168,7 @@ fn read_stream(
     Ok(buf)
 }
 
-fn inflate_raw(path: &Path, raw: &[u8]) -> Result<Vec<u8>> {
+pub(super) fn inflate_raw(path: &Path, raw: &[u8]) -> Result<Vec<u8>> {
     let mut decoder = flate2::Decompress::new(false);
     let mut out = Vec::new();
     let mut buffer = [0; 8192];

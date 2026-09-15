@@ -215,6 +215,55 @@ fn hwp_date_and_cell_edits_are_near_but_never_exact() {
 }
 
 #[test]
+fn legacy_hwp_is_compared_and_scanned_through_the_public_commands() {
+    let dir = fixture_dir("hwp3-업무자료", &[]);
+    for (name, value) in [("a.hwp", "100"), ("b.hwp", "101"), ("copy.hwp", "100")] {
+        let text = format!("Daily report 2026-09-15 amount {value}");
+        let mut bytes = b"HWP Document File V3.00 \x1a\x01\x02\x03\x04\x05".to_vec();
+        bytes.resize(30 + 128 + 1008 + 16, 0);
+        let mut paragraph = vec![0; 43 + 187 + 14];
+        paragraph[1..3].copy_from_slice(&((text.len() + 1) as u16).to_le_bytes());
+        paragraph[3..5].copy_from_slice(&1u16.to_le_bytes());
+        bytes.extend(paragraph);
+        bytes.extend(text.encode_utf16().chain([13]).flat_map(u16::to_le_bytes));
+        bytes.extend([0; 43]);
+        std::fs::write(dir.join(name), bytes).unwrap();
+    }
+    for (other, equal) in [("b.hwp", false), ("copy.hwp", true)] {
+        let out = dupey()
+            .arg("compare")
+            .arg(dir.join("a.hwp"))
+            .arg(dir.join(other))
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains(&format!("exact_equal\t{equal}")),
+            "{out:?}"
+        );
+    }
+    let scan = scan_json(&dir);
+    assert!(scan["errors"].as_array().unwrap().is_empty(), "{scan}");
+    let files = scan["files"].as_array().unwrap();
+    assert_eq!(files.len(), 3);
+    assert_ne!(files[0]["content_hash"], files[1]["content_hash"]);
+    assert_eq!(files[0]["content_hash"], files[2]["content_hash"]);
+    for file in files {
+        let out = dupey()
+            .arg("fingerprint")
+            .arg(file["path"].as_str().unwrap())
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        assert!(String::from_utf8_lossy(&out.stdout).contains(&format!(
+            "exact\t{}",
+            file["content_hash"].as_str().unwrap()
+        )));
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn compare_empty_extractions_uses_original_bytes() {
     let dir = fixture_dir("compare-empty", &[]);
     let a = empty_page_pdf();

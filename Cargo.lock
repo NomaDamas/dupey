@@ -627,6 +627,7 @@ version = "0.1.2"
 dependencies = [
  "cfb",
  "criterion",
+ "encoding_rs",
  "flate2",
  "gaoya",
  "hex",
