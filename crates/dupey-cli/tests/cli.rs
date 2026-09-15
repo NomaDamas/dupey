@@ -124,6 +124,192 @@ fn empty_page_pdf() -> Vec<u8> {
     pdf.into_bytes()
 }
 
+fn report_hwp(date: &str, value: &str) -> Vec<u8> {
+    use std::io::Write;
+    let mut section = Vec::new();
+    let mut record = |tag: u32, level: u32, data: &[u8]| {
+        section
+            .extend_from_slice(&(tag | (level << 10) | ((data.len() as u32) << 20)).to_le_bytes());
+        section.extend_from_slice(data);
+    };
+    record(66, 0, &[0; 22]); // PARA_HEADER, not divisible by four
+    for text in [PROPOSAL, "일일 보고서"] {
+        record(
+            67,
+            1,
+            &text
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>(),
+        );
+    }
+    record(75, 2, &[0; 22]); // table, with nested cell paragraphs
+    for text in [date, value] {
+        record(72, 2, &[0; 34]);
+        record(66, 2, &[0; 22]);
+        record(
+            67,
+            3,
+            &text
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>(),
+        );
+    }
+    let mut ole = cfb::CompoundFile::create(std::io::Cursor::new(Vec::new())).unwrap();
+    let mut header = [0; 256];
+    header[..17].copy_from_slice(b"HWP Document File");
+    header[32..36].copy_from_slice(&0x05000300u32.to_le_bytes());
+    ole.create_stream("FileHeader")
+        .unwrap()
+        .write_all(&header)
+        .unwrap();
+    ole.create_storage("BodyText").unwrap();
+    ole.create_stream("BodyText/Section0")
+        .unwrap()
+        .write_all(&section)
+        .unwrap();
+    ole.into_inner().into_inner()
+}
+
+#[test]
+fn hwp_date_and_cell_edits_are_near_but_never_exact() {
+    let dir = fixture_dir("hwp-report-edits", &[]);
+    for (name, date, value) in [
+        ("a.hwp", "2026-09-14", "1,200"),
+        ("b.hwp", "2026-09-15", "1,200"),
+        ("c.hwp", "2026-09-14", "1,201"),
+        ("copy.hwp", "2026-09-14", "1,200"),
+    ] {
+        std::fs::write(dir.join(name), report_hwp(date, value)).unwrap();
+    }
+    for other in ["b.hwp", "c.hwp"] {
+        let out = dupey()
+            .arg("compare")
+            .arg(dir.join("a.hwp"))
+            .arg(dir.join(other))
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("exact_equal\tfalse"),
+            "{:?}",
+            out
+        );
+    }
+    let v = scan_json(&dir);
+    assert!(v["errors"].as_array().unwrap().is_empty());
+    assert_eq!(v["families"].as_array().unwrap().len(), 1, "{v}");
+    let files = v["files"].as_array().unwrap();
+    assert_ne!(files[0]["content_hash"], files[1]["content_hash"]);
+    assert_ne!(files[0]["content_hash"], files[2]["content_hash"]);
+    assert_eq!(files[0]["content_hash"], files[3]["content_hash"]);
+    let edges = v["families"][0]["edges"].as_array().unwrap();
+    assert!(edges.iter().any(|e| e["relation"] == "near"), "{v}");
+    for edge in edges.iter().filter(|e| e["relation"] == "exact") {
+        let a = Path::new(edge["a"].as_str().unwrap()).file_name().unwrap();
+        let b = Path::new(edge["b"].as_str().unwrap()).file_name().unwrap();
+        assert!(a == "a.hwp" && b == "copy.hwp", "false exact edge: {edge}");
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn compare_empty_extractions_uses_original_bytes() {
+    let dir = fixture_dir("compare-empty", &[]);
+    let a = empty_page_pdf();
+    let mut b = a.clone();
+    b.extend_from_slice(b"\n% Different original file\n");
+    std::fs::write(dir.join("a.pdf"), &a).unwrap();
+    std::fs::write(dir.join("b.pdf"), &b).unwrap();
+    std::fs::write(dir.join("copy.pdf"), &a).unwrap();
+    for (other, expected) in [("b.pdf", false), ("copy.pdf", true)] {
+        let out = dupey()
+            .arg("compare")
+            .arg(dir.join("a.pdf"))
+            .arg(dir.join(other))
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        assert!(String::from_utf8_lossy(&out.stdout).contains(&format!("exact_equal\t{expected}")));
+    }
+    for name in ["a.pdf", "b.pdf"] {
+        let out = dupey()
+            .arg("fingerprint")
+            .arg(dir.join(name))
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let expected = dupey_core::byte_hash_hex(&std::fs::read(dir.join(name)).unwrap());
+        assert!(String::from_utf8_lossy(&out.stdout).contains(&format!("exact\t{expected}")));
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn malformed_hwp_is_reported_without_hashing_its_valid_prefix() {
+    use std::io::{Seek, SeekFrom, Write};
+    let dir = fixture_dir("hwp-malformed", &[]);
+    let bytes = report_hwp("2026-09-15", "1,200");
+    std::fs::write(dir.join("valid.hwp"), &bytes).unwrap();
+    let mut ole = cfb::CompoundFile::open(std::io::Cursor::new(bytes)).unwrap();
+    {
+        let mut section = ole.open_stream("BodyText/Section0").unwrap();
+        section.seek(SeekFrom::End(0)).unwrap();
+        section.write_all(&[0x43]).unwrap(); // incomplete next record
+    }
+    std::fs::write(dir.join("broken.hwp"), ole.into_inner().into_inner()).unwrap();
+    let out = dupey()
+        .arg("compare")
+        .arg(dir.join("valid.hwp"))
+        .arg(dir.join("broken.hwp"))
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let v = scan_json(&dir);
+    assert_eq!(v["files"].as_array().unwrap().len(), 1);
+    assert!(v["families"].as_array().unwrap().is_empty());
+    assert_eq!(v["errors"].as_array().unwrap().len(), 1);
+    assert!(v["errors"][0]["error"]
+        .as_str()
+        .unwrap()
+        .contains("truncated record header"));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn whitespace_only_copies_use_byte_hash_in_all_commands() {
+    let dir = fixture_dir(
+        "whitespace-exact",
+        &[("a.txt", " \n"), ("b.txt", " \n"), ("c.txt", "\t")],
+    );
+    let v = scan_json(&dir);
+    assert_eq!(v["families"].as_array().unwrap().len(), 1);
+    assert_eq!(v["families"][0]["relation"], "exact");
+    assert_eq!(v["families"][0]["files"].as_array().unwrap().len(), 2);
+    for file in v["files"].as_array().unwrap() {
+        assert!(file["fuzzy"].is_null());
+        let path = file["path"].as_str().unwrap();
+        let hash = dupey_core::byte_hash_hex(&std::fs::read(path).unwrap());
+        assert_eq!(file["content_hash"], hash);
+        let out = dupey().arg("fingerprint").arg(path).output().unwrap();
+        assert!(out.status.success());
+        assert!(String::from_utf8_lossy(&out.stdout).contains(&format!("exact\t{hash}")));
+    }
+    let out = dupey()
+        .arg("compare")
+        .arg(dir.join("a.txt"))
+        .arg(dir.join("b.txt"))
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("exact_equal\ttrue"));
+    assert!(text.contains("near_score\t0.0000"));
+    assert!(text.contains("jaccard\t0.0000"));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 const PROPOSAL: &str =
     "프로젝트 제안서\n\n1. 배경\n본 제안은 2026년 하반기 사무 자동화 도입을 위한 것이다. \
      현재 팀은 문서가 폴더에 흩어져 있고 최신본을 찾기 어렵다.\n\n2. 범위\n문서 수집, \

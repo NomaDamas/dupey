@@ -84,6 +84,18 @@ Supported input:
 | `xlsx` | Cell values with shared-string and date handling |
 | `pdf` | Embedded text; image-only scans are reported but not compared |
 
+`exact` compares extracted text, including HWP dates, displayed field values,
+and table-cell text. It does not assert identical formatting or embedded images.
+When extraction has no non-whitespace text, `scan`, `compare`, and `fingerprint`
+use original file bytes for exact matching; fuzzy comparison is unavailable.
+Malformed HWP records or compressed streams, password-encrypted documents,
+and distribution documents are reported as extraction errors.
+
+**HWP reindexing:** Regenerate stored HWP fingerprints and scan results created
+with 0.1.2 or earlier. Those versions misread record byte lengths as four-byte
+units and could silently hash incomplete or empty text. Corrected extraction
+changes HWP content hashes and similarity scores.
+
 ## How it works
 
 ```text
