@@ -1,6 +1,7 @@
 mod budget;
 mod skip;
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -122,12 +123,13 @@ fn compare(a: &Path, b: &Path) -> Result<()> {
 // ---------- scan: the public contract ----------
 
 #[derive(Serialize)]
-struct FileEntry {
+struct FileEntry<'a> {
     path: String,
     format: Format,
     content_hash: String,
     /// MinHash signature (128-wide), null for empty/scanned content.
-    fuzzy: Option<Vec<u64>>,
+    /// Borrowed from the clustered document instead of kept twice.
+    fuzzy: Option<&'a [u64]>,
     signals: FileSignals,
 }
 
@@ -167,7 +169,7 @@ struct PickOut {
 }
 
 #[derive(Serialize)]
-struct ScanOut {
+struct ScanOut<'a> {
     dir: String,
     /// Jaccard threshold for `near`.
     threshold: f64,
@@ -175,7 +177,7 @@ struct ScanOut {
     contains_threshold: f64,
     /// Jaccard floor for `contains`.
     contains_min_jaccard: f64,
-    files: Vec<FileEntry>,
+    files: Vec<FileEntry<'a>>,
     families: Vec<FamilyOut>,
     errors: Vec<ErrorEntry>,
 }
@@ -316,7 +318,9 @@ fn scan(dir: &Path, json: bool, config: ClusterConfig, extra_exclude: &[String])
     anyhow::ensure!(dir.exists(), "scan path does not exist: {}", dir.display());
 
     let t0 = std::time::Instant::now();
-    let mut files: Vec<FileEntry> = Vec::new();
+    // File rows are completed with their fuzzy signature once `docs` stops
+    // growing; `has_text` records which rows get one.
+    let mut file_rows: Vec<(FileEntry<'static>, bool)> = Vec::new();
     let mut docs: Vec<ScannedDoc> = Vec::new();
     let mut metas: Vec<(DocInfo, Option<jiff::Timestamp>)> = Vec::new();
     let mut errors: Vec<ErrorEntry> = Vec::new();
@@ -352,20 +356,22 @@ fn scan(dir: &Path, json: bool, config: ClusterConfig, extra_exclude: &[String])
                     shingles,
                     chars,
                 } = prepared;
-                let fuzzy = has_text.then(|| sig.values.clone());
                 let content_hash = byte_hash.clone().unwrap_or_else(|| exact_hash.clone());
-                files.push(FileEntry {
-                    path: info.path.display().to_string(),
-                    format: info.format,
-                    content_hash,
-                    fuzzy,
-                    signals: FileSignals {
-                        chars,
-                        modified: info.meta.modified.map(|t| t.to_string()),
-                        revision: info.meta.revision,
-                        fs_mtime: fs_mtime.map(|t| t.to_string()),
+                file_rows.push((
+                    FileEntry {
+                        path: info.path.display().to_string(),
+                        format: info.format,
+                        content_hash,
+                        fuzzy: None,
+                        signals: FileSignals {
+                            chars,
+                            modified: info.meta.modified.map(|t| t.to_string()),
+                            revision: info.meta.revision,
+                            fs_mtime: fs_mtime.map(|t| t.to_string()),
+                        },
                     },
-                });
+                    has_text,
+                ));
                 docs.push(match byte_hash {
                     Some(byte_hash) => ScannedDoc::from_precomputed_with_byte_hash(
                         info.path.clone(),
@@ -396,7 +402,7 @@ fn scan(dir: &Path, json: bool, config: ClusterConfig, extra_exclude: &[String])
         eprintln!("cluster: {:?}", t_cluster.elapsed());
     }
     let mut family_out = Vec::new();
-    for fam in &families {
+    for fam in families {
         let signals: Vec<MemberSignals> = fam
             .members
             .iter()
@@ -422,8 +428,8 @@ fn scan(dir: &Path, json: bool, config: ClusterConfig, extra_exclude: &[String])
                 .iter()
                 .map(|m| m.path.display().to_string())
                 .collect(),
-            members: fam.members.clone(),
-            edges: fam.edges.clone(),
+            members: fam.members,
+            edges: fam.edges,
             pick: PickOut {
                 reasons: ranking
                     .ranked
@@ -436,6 +442,16 @@ fn scan(dir: &Path, json: bool, config: ClusterConfig, extra_exclude: &[String])
         });
     }
 
+    let files: Vec<FileEntry<'_>> = file_rows
+        .into_iter()
+        .zip(&docs)
+        .map(|((row, has_text), doc)| {
+            let mut row: FileEntry<'_> = row;
+            row.fuzzy = has_text.then_some(doc.sig.values.as_slice());
+            row
+        })
+        .collect();
+
     let out = ScanOut {
         dir: dir.display().to_string(),
         threshold: config.near_threshold,
@@ -447,7 +463,12 @@ fn scan(dir: &Path, json: bool, config: ClusterConfig, extra_exclude: &[String])
     };
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&out)?);
+        // Stream straight to stdout: the pretty document can run to
+        // hundreds of megabytes and never needs to exist as one string.
+        let mut stdout = std::io::BufWriter::new(std::io::stdout().lock());
+        serde_json::to_writer_pretty(&mut stdout, &out)?;
+        writeln!(stdout)?;
+        stdout.flush()?;
     } else {
         println!("scanned {}\t{} files", out.dir, out.files.len());
         for e in &out.errors {
