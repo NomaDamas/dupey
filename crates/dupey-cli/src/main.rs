@@ -9,9 +9,9 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use dupey_core::{
     byte_hash_hex, cluster_with_config, containment, exact_hash_hex, extract, extract_size_hint,
-    near_sig, rank, shingles, ClusterConfig, DocMeta, Format, MemberSignals, NearSignature,
-    ScannedDoc, ShingleStore, Shingles, DEFAULT_CONTAINS_MIN_JACCARD, DEFAULT_CONTAINS_THRESHOLD,
-    DEFAULT_NEAR_THRESHOLD,
+    near_sig, rank, shingles, CanonicalText, ClusterConfig, DocMeta, Format, MemberSignals,
+    NearSignature, ScannedDoc, ShingleStore, Shingles, DEFAULT_CONTAINS_MIN_JACCARD,
+    DEFAULT_CONTAINS_THRESHOLD, DEFAULT_NEAR_THRESHOLD,
 };
 use serde::Serialize;
 
@@ -88,7 +88,7 @@ fn fingerprint(path: &Path) -> Result<()> {
     println!("path\t{}", canon.path.display());
     println!("format\t{:?}", canon.format);
     println!("chars\t{}", canon.text.chars().count());
-    println!("exact\t{}", exact_hash_hex(&canon.text));
+    println!("exact\t{}", comparison_hash(&canon)?);
     println!("minhash_width\t{}", sig.values.len());
     match &canon.meta.modified {
         Some(t) => println!("modified\t{t}"),
@@ -101,15 +101,36 @@ fn fingerprint(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Empty extraction proves no content equality; use the same original-byte
+/// fallback as scan instead of comparing two hashes of the empty string.
+fn comparison_hash(canon: &CanonicalText) -> Result<String> {
+    if canon.text.trim().is_empty() {
+        let bytes =
+            std::fs::read(&canon.path).with_context(|| format!("read {}", canon.path.display()))?;
+        Ok(byte_hash_hex(&bytes))
+    } else {
+        Ok(exact_hash_hex(&canon.text))
+    }
+}
+
 fn compare(a: &Path, b: &Path) -> Result<()> {
     let ca = extract(a).with_context(|| format!("extract {}", a.display()))?;
     let cb = extract(b).with_context(|| format!("extract {}", b.display()))?;
-    let ha = exact_hash_hex(&ca.text);
-    let hb = exact_hash_hex(&cb.text);
+    let ha = comparison_hash(&ca)?;
+    let hb = comparison_hash(&cb)?;
     let sa = dupey_core::shingles(&ca.text);
     let sb = dupey_core::shingles(&cb.text);
-    let near = dupey_core::score(&near_sig(&ca.text), &near_sig(&cb.text));
-    let jaccard = dupey_core::exact_jaccard(&sa, &sb);
+    let comparable = !sa.is_empty() && !sb.is_empty();
+    let near = if comparable {
+        dupey_core::score(&near_sig(&ca.text), &near_sig(&cb.text))
+    } else {
+        0.0
+    };
+    let jaccard = if comparable {
+        dupey_core::exact_jaccard(&sa, &sb)
+    } else {
+        0.0
+    };
     let a_in_b = containment(&sb, &sa);
     let b_in_a = containment(&sa, &sb);
     println!("a\t{}", a.display());
@@ -236,7 +257,7 @@ const LARGE_FILE_BUDGET: u64 = 1 << 30;
 /// memory, the rest of the shingle set goes to `store`.
 fn prepare(path: &Path, store: &Arc<ShingleStore>) -> Result<PreparedScan, PrepareError> {
     let canon = extract(path)?;
-    let byte_hash = if canon.text.is_empty() {
+    let byte_hash = if canon.text.trim().is_empty() {
         Some(byte_hash_hex(&std::fs::read(path).map_err(|source| {
             dupey_core::Error::Io {
                 path: path.to_path_buf(),
@@ -256,7 +277,8 @@ fn prepare(path: &Path, store: &Arc<ShingleStore>) -> Result<PreparedScan, Prepa
     let sig = near_sig(&canon.text);
     let shingles = Shingles::stored(shingles(&canon.text), store).map_err(PrepareError::Store)?;
     let chars = canon.text.chars().count();
-    let has_text = !canon.text.is_empty();
+    // Whitespace-only text has no shingles and nothing to compare fuzzily.
+    let has_text = !shingles.is_empty();
     Ok(PreparedScan {
         info: DocInfo {
             path: canon.path,
@@ -379,6 +401,7 @@ fn scan(dir: &Path, json: bool, config: ClusterConfig, extra_exclude: &[String])
                     shingles,
                     chars,
                 } = prepared;
+
                 let content_hash = byte_hash.clone().unwrap_or_else(|| exact_hash.clone());
                 file_rows.push((
                     FileEntry {

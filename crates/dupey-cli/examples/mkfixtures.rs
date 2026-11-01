@@ -98,12 +98,13 @@ fn write_hwpx(path: &Path, paragraphs: &[&str], date: &str) {
 fn write_hwp(path: &Path, paras: &[&str]) {
     let mut section = Vec::new();
     let mut put_record = |tag: u16, level: u32, text: &str| {
-        let mut utf16: Vec<u8> = text.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
-        while !utf16.len().is_multiple_of(4) {
-            utf16.extend_from_slice(&0u16.to_le_bytes());
-        }
-        let header: u32 = tag as u32 | (level << 10) | ((utf16.len() as u32 / 4) << 20);
+        let utf16: Vec<u8> = text.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+        let size = utf16.len().min(0xFFF) as u32;
+        let header: u32 = tag as u32 | (level << 10) | (size << 20);
         section.extend_from_slice(&header.to_le_bytes());
+        if size == 0xFFF {
+            section.extend_from_slice(&(utf16.len() as u32).to_le_bytes());
+        }
         section.extend_from_slice(&utf16);
     };
     for p in paras {

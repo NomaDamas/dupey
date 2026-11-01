@@ -79,10 +79,31 @@ Supported input:
 | --- | --- |
 | `txt`, `md` | UTF-8 text with normalized newlines |
 | `docx` | Paragraph text and internal modification metadata |
-| `hwp`, `hwpx` | Comparable body text and available internal timestamps |
+| `hwp` | HWP 3.0 (legacy binary) and HWP 5.x (CFB), with compressed/uncompressed body text |
+| `hwpx` | Comparable body text and available internal timestamps |
 | `pptx` | Slide text, excluding speaker notes |
 | `xlsx` | Cell values with shared-string and date handling |
 | `pdf` | Embedded text; image-only scans are reported but not compared |
+
+`exact` compares extracted text, including HWP dates, displayed field values,
+and table-cell text. It does not assert identical formatting or embedded images.
+When extraction has no non-whitespace text, `scan`, `compare`, and `fingerprint`
+use original file bytes for exact matching; fuzzy comparison is unavailable.
+Malformed HWP records or compressed streams, password-encrypted documents,
+and distribution documents are reported as extraction errors.
+
+Legacy HWP 3.0 files start with `HWP Document File V3.00`, not the CFB signature.
+They are detected automatically and decoded with their own Korean character
+encoding. Extraction includes tables, textboxes (including grouped drawings),
+headers/footers, notes, captions, date codes, and displayed reference values.
+Outline numbers use normalized notation retaining custom bullets and decorations;
+this is text extraction, not a page renderer. Unsupported characters or malformed
+nested structures produce errors instead of a hash of incomplete text.
+
+**HWP reindexing:** Regenerate stored HWP fingerprints and scan results created
+with 0.1.2 or earlier. Those versions misread record byte lengths as four-byte
+units and could silently hash incomplete or empty text. Corrected extraction
+changes HWP content hashes and similarity scores.
 
 ## How it works
 
