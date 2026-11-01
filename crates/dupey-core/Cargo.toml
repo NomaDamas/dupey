@@ -23,6 +23,7 @@ quick-xml = "0.41.0"
 rayon.workspace = true
 serde.workspace = true
 sha2.workspace = true
+tempfile = "3"
 thiserror.workspace = true
 walkdir.workspace = true
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }

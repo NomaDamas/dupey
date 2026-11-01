@@ -3,13 +3,15 @@ mod skip;
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use dupey_core::{
     byte_hash_hex, cluster_with_config, containment, exact_hash_hex, extract, extract_size_hint,
     near_sig, rank, shingles, ClusterConfig, DocMeta, Format, MemberSignals, NearSignature,
-    ScannedDoc, DEFAULT_CONTAINS_MIN_JACCARD, DEFAULT_CONTAINS_THRESHOLD, DEFAULT_NEAR_THRESHOLD,
+    ScannedDoc, ShingleStore, Shingles, DEFAULT_CONTAINS_MIN_JACCARD, DEFAULT_CONTAINS_THRESHOLD,
+    DEFAULT_NEAR_THRESHOLD,
 };
 use serde::Serialize;
 
@@ -197,8 +199,22 @@ struct PreparedScan {
     byte_hash: Option<String>,
     has_text: bool,
     sig: NearSignature,
-    shingles: Vec<u64>,
+    shingles: Shingles,
     chars: usize,
+}
+
+/// Why one file could not be prepared.
+enum PrepareError {
+    /// The file itself: reported in `errors[]` while the scan goes on.
+    File(dupey_core::Error),
+    /// The temporary shingle store: the whole scan fails.
+    Store(std::io::Error),
+}
+
+impl From<dupey_core::Error> for PrepareError {
+    fn from(e: dupey_core::Error) -> Self {
+        Self::File(e)
+    }
 }
 
 /// Files whose extracted text may exceed this many bytes (the file size, or
@@ -216,8 +232,9 @@ const LARGE_FILE_THREADS: usize = 4;
 const LARGE_FILE_BUDGET: u64 = 1 << 30;
 
 /// Extract, hash, and fingerprint one file. The extracted text is dropped
-/// before returning; only hashes, shingles, and metadata are kept.
-fn prepare(path: &Path) -> dupey_core::Result<PreparedScan> {
+/// before returning; only hashes, metadata, and the shingle prefix stay in
+/// memory, the rest of the shingle set goes to `store`.
+fn prepare(path: &Path, store: &Arc<ShingleStore>) -> Result<PreparedScan, PrepareError> {
     let canon = extract(path)?;
     let byte_hash = if canon.text.is_empty() {
         Some(byte_hash_hex(&std::fs::read(path).map_err(|source| {
@@ -237,7 +254,7 @@ fn prepare(path: &Path) -> dupey_core::Result<PreparedScan> {
         .and_then(|d| jiff::Timestamp::from_duration(d).ok());
     let exact_hash = exact_hash_hex(&canon.text);
     let sig = near_sig(&canon.text);
-    let shingles = shingles(&canon.text);
+    let shingles = Shingles::stored(shingles(&canon.text), store).map_err(PrepareError::Store)?;
     let chars = canon.text.chars().count();
     let has_text = !canon.text.is_empty();
     Ok(PreparedScan {
@@ -261,7 +278,10 @@ fn prepare(path: &Path) -> dupey_core::Result<PreparedScan> {
 /// threads that only start one when its estimated transient fits the
 /// budget. Rayon workers never block, so extractors that use rayon
 /// internally cannot deadlock.
-fn prepare_all(paths: &[PathBuf]) -> Vec<dupey_core::Result<PreparedScan>> {
+fn prepare_all(
+    paths: &[PathBuf],
+    store: &Arc<ShingleStore>,
+) -> Vec<Result<PreparedScan, PrepareError>> {
     use rayon::prelude::*;
     let (large_tx, large_rx) = std::sync::mpsc::channel::<(usize, u64)>();
     let large_rx = std::sync::Mutex::new(large_rx);
@@ -275,13 +295,13 @@ fn prepare_all(paths: &[PathBuf]) -> Vec<dupey_core::Result<PreparedScan>> {
                         let next = large_rx.lock().unwrap_or_else(|e| e.into_inner()).recv();
                         let Ok((i, cost)) = next else { break };
                         let _permit = budget.acquire(cost);
-                        done.push((i, prepare(&paths[i])));
+                        done.push((i, prepare(&paths[i], store)));
                     }
                     done
                 })
             })
             .collect();
-        let mut results: Vec<Option<dupey_core::Result<PreparedScan>>> = paths
+        let mut results: Vec<Option<Result<PreparedScan, PrepareError>>> = paths
             .par_iter()
             .enumerate()
             .map_with(large_tx, |large_tx, (i, path)| {
@@ -293,7 +313,7 @@ fn prepare_all(paths: &[PathBuf]) -> Vec<dupey_core::Result<PreparedScan>> {
                         .expect("large-file threads outlive the small-file pass");
                     None
                 } else {
-                    Some(prepare(path))
+                    Some(prepare(path, store))
                 }
             })
             .collect();
@@ -342,7 +362,10 @@ fn scan(dir: &Path, json: bool, config: ClusterConfig, extra_exclude: &[String])
 
     // Extract + hash + signature is the scan bottleneck; it is pure I/O
     // and CPU per file, so it parallelizes cleanly. Order is preserved.
-    let results = prepare_all(&paths);
+    // Shingle sets past their in-memory prefix go to a temporary file the
+    // OS deletes when the scan ends; clustering reads them back on demand.
+    let store = Arc::new(ShingleStore::temp().context("creating the temporary shingle store")?);
+    let results = prepare_all(&paths, &store);
     for (path, result) in paths.iter().zip(results) {
         match result {
             Ok(prepared) => {
@@ -386,10 +409,13 @@ fn scan(dir: &Path, json: bool, config: ClusterConfig, extra_exclude: &[String])
                 });
                 metas.push((info, fs_mtime));
             }
-            Err(e) => errors.push(ErrorEntry {
+            Err(PrepareError::File(e)) => errors.push(ErrorEntry {
                 path: path.display().to_string(),
                 error: e.to_string(),
             }),
+            Err(PrepareError::Store(e)) => {
+                return Err(e).context("writing shingles to the temporary shingle store");
+            }
         }
     }
 
