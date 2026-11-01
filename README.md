@@ -100,6 +100,15 @@ Near-duplicate detection is lexical, not semantic. This keeps results local,
 fast, and understandable while avoiding unrelated documents that merely share
 a topic.
 
+`scan` keeps memory bounded on large folders. Each document keeps only a
+sorted prefix of its shingle set in memory (about an eighth of it); the rest
+goes to an anonymous temporary file in the system temp directory (`TMPDIR`
+on macOS and Linux) that the operating system deletes when the scan ends.
+An exact upper bound computed from the prefixes rules out most candidate
+pairs, so only likely matches read their full sets back. Families are
+identical to keeping everything in memory. Expect roughly 1.5 GB of
+temporary disk for 80,000 office documents.
+
 ## Latest-candidate ranking
 
 Within a family, dupey ranks files by modification time:

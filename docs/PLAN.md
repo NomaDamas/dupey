@@ -26,6 +26,10 @@ families and an explainable latest candidate.
 - Candidates generated one document at a time in ascending pair order, so
   the full candidate set is never held in memory; `scan --json` streams to
   stdout
+- Shingle sets past an in-memory prefix (the bottom-k sketch plus every
+  hash below an eighth of the range) live in an anonymous temporary file
+  during `scan`; an exact upper bound on the overlap, computed from the
+  prefixes, rejects most candidate pairs before any full set is read back
 - Latest-candidate ranking by modification time only: internal timestamp
   first, filesystem timestamp second
 - Stable public contract through `dupey scan DIR --json`

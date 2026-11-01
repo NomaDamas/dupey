@@ -14,9 +14,11 @@ use std::path::PathBuf;
 use rayon::prelude::*;
 
 use crate::near::{
-    near_sig, overlap_at_least, score, shingles, NearSignature, DEFAULT_CONTAINS_MIN_JACCARD,
-    DEFAULT_CONTAINS_THRESHOLD, DEFAULT_NEAR_THRESHOLD, MINHASH_CANDIDATE_THRESHOLD,
+    near_sig, overlap_at_least, score, shared_upper_bound, shingles, NearSignature,
+    DEFAULT_CONTAINS_MIN_JACCARD, DEFAULT_CONTAINS_THRESHOLD, DEFAULT_NEAR_THRESHOLD,
+    MINHASH_CANDIDATE_THRESHOLD,
 };
+use crate::store::Shingles;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -150,10 +152,8 @@ pub struct ScannedDoc {
     pub exact_hash: String,
     pub byte_hash: Option<String>,
     pub sig: NearSignature,
-    pub shingles: Vec<u64>,
-    /// k smallest shingle hashes; inverted index key for containment
-    /// candidate generation.
-    pub sketch: Vec<u64>,
+    /// Sorted shingle set; may keep everything past its prefix on disk.
+    pub shingles: Shingles,
 }
 
 impl ScannedDoc {
@@ -166,15 +166,14 @@ impl ScannedDoc {
         path: PathBuf,
         exact_hash: String,
         sig: NearSignature,
-        shingles: Vec<u64>,
+        shingles: impl Into<Shingles>,
     ) -> Self {
         Self {
             path,
             exact_hash,
             byte_hash: None,
             sig,
-            sketch: shingles.iter().take(SKETCH_K).copied().collect(),
-            shingles,
+            shingles: shingles.into(),
         }
     }
 
@@ -183,11 +182,18 @@ impl ScannedDoc {
         exact_hash: String,
         byte_hash: String,
         sig: NearSignature,
-        shingles: Vec<u64>,
+        shingles: impl Into<Shingles>,
     ) -> Self {
         let mut doc = Self::from_precomputed(path, exact_hash, sig, shingles);
         doc.byte_hash = Some(byte_hash);
         doc
+    }
+
+    /// The `SKETCH_K` smallest shingle hashes: the inverted-index key for
+    /// containment candidate generation.
+    pub fn sketch(&self) -> &[u64] {
+        let prefix = self.shingles.prefix();
+        &prefix[..prefix.len().min(SKETCH_K)]
     }
 
     /// Scanned PDFs and empty files have no comparable content.
@@ -221,6 +227,11 @@ pub fn cluster(docs: &[ScannedDoc], threshold: f64) -> Vec<Family> {
 }
 
 /// Cluster with independent near and contains thresholds.
+///
+/// # Panics
+///
+/// If a document's shingles live in a [`crate::ShingleStore`] that can no
+/// longer be read.
 pub fn cluster_with_config(docs: &[ScannedDoc], config: &ClusterConfig) -> Vec<Family> {
     let threshold = config.near_threshold;
     let candidate_threshold = MINHASH_CANDIDATE_THRESHOLD.min(threshold);
@@ -406,7 +417,7 @@ impl CandidateIndex {
 
         let mut postings: Vec<(u64, u32)> = comp
             .iter()
-            .flat_map(|&i| docs[i].sketch.iter().map(move |&h| (h, doc_id(i))))
+            .flat_map(|&i| docs[i].sketch().iter().map(move |&h| (h, doc_id(i))))
             .collect();
         postings.sort_unstable();
         let mut kept = 0;
@@ -445,7 +456,7 @@ impl CandidateIndex {
             .map(|&j| j as usize)
             .filter(|&j| j > i)
             .collect();
-        for &h in &docs[i].sketch {
+        for &h in docs[i].sketch() {
             let start = self.postings.partition_point(|&(value, _)| value < h);
             for &(value, j) in &self.postings[start..] {
                 if value != h {
@@ -475,6 +486,11 @@ fn doc_id(i: usize) -> u32 {
 /// A single merge intersect produces Jaccard and both containment
 /// directions, so near and contains are always evaluated together and the
 /// pair is described by whichever relation it actually satisfies.
+///
+/// # Panics
+///
+/// If a document's shingles live in a [`crate::ShingleStore`] that can no
+/// longer be read.
 fn verify_pair(
     docs: &[ScannedDoc],
     i: usize,
@@ -486,20 +502,27 @@ fn verify_pair(
         // pair would be duplicate evidence.
         return None;
     }
-    let (a, b) = (&docs[i].shingles, &docs[j].shingles);
+    let (sa, sb) = (&docs[i].shingles, &docs[j].shingles);
     // Smallest intersection that could satisfy either relation:
     //   jaccard  = s / (|a| + |b| - s) >= t   <=>  s >= t(|a| + |b|) / (1 + t)
     //   contains = s / min(|a|, |b|)   >= c   <=>  s >= c * min(|a|, |b|)
     // and contains additionally has to clear the Jaccard floor. Anything
     // below both relations' floors is not a family under any label, so the
     // intersect can stop as soon as it becomes unreachable.
-    let total = (a.len() + b.len()) as f64;
+    let total = (sa.len() + sb.len()) as f64;
     let jaccard_floor = |t: f64| t * total / (1.0 + t);
     let near_floor = jaccard_floor(config.near_threshold);
-    let contains_floor = (config.contains_threshold * a.len().min(b.len()) as f64)
+    let contains_floor = (config.contains_threshold * sa.len().min(sb.len()) as f64)
         .max(jaccard_floor(config.contains_min_jaccard));
     let min_shared = near_floor.min(contains_floor).ceil().max(0.0) as usize;
-    let stats = overlap_at_least(a, b, min_shared)?;
+    // The in-memory prefixes bound the overlap exactly from above. A pair
+    // that cannot reach the floor is one `overlap_at_least` would reject
+    // anyway, so it is dropped here without reading either full set.
+    if shared_upper_bound(sa.prefix(), sa.len(), sb.prefix(), sb.len()) < min_shared {
+        return None;
+    }
+    let (a, b) = (load_full(sa), load_full(sb));
+    let stats = overlap_at_least(&a, &b, min_shared)?;
     let near_score = score(&docs[i].sig, &docs[j].sig);
     if stats.jaccard >= config.near_threshold {
         return Some(VerifiedEdge {
@@ -530,6 +553,12 @@ fn verify_pair(
         });
     }
     None
+}
+
+fn load_full(shingles: &Shingles) -> std::borrow::Cow<'_, [u64]> {
+    shingles
+        .load()
+        .unwrap_or_else(|e| panic!("reading shingles back from the shingle store: {e}"))
 }
 
 /// A verified pair while clustering: document indices, not paths, so the hot
@@ -655,6 +684,11 @@ mod tests {
         ScannedDoc::from_text(PathBuf::from(name), text)
     }
 
+    /// The document's complete shingle set.
+    fn full(d: &ScannedDoc) -> Vec<u64> {
+        d.shingles.load().unwrap().into_owned()
+    }
+
     // Most tests exercise the configurable entry point. Keep the short name
     // local so the fixtures stay readable while the public `cluster` wrapper
     // retains its historical `(docs, threshold)` contract.
@@ -716,8 +750,8 @@ mod tests {
     #[test]
     fn contains_threshold_is_separate_from_near_threshold() {
         let docs = template_siblings(2, 93, 7);
-        let observed = containment(&docs[0].shingles, &docs[1].shingles)
-            .max(containment(&docs[1].shingles, &docs[0].shingles));
+        let observed = containment(&full(&docs[0]), &full(&docs[1]))
+            .max(containment(&full(&docs[1]), &full(&docs[0])));
         assert!(
             (DEFAULT_NEAR_THRESHOLD..DEFAULT_CONTAINS_THRESHOLD).contains(&observed),
             "fixture must land between the two thresholds, got {observed}"
@@ -930,7 +964,7 @@ mod tests {
                 let text = variant.join(" ");
                 let candidate = doc("candidate.hwp", &text);
                 let estimate = score(&base_doc.sig, &candidate.sig);
-                let jaccard = exact_jaccard(&base_doc.shingles, &candidate.shingles);
+                let jaccard = exact_jaccard(&full(&base_doc), &full(&candidate));
                 ((MINHASH_CANDIDATE_THRESHOLD..DEFAULT_NEAR_THRESHOLD).contains(&estimate)
                     && jaccard >= DEFAULT_NEAR_THRESHOLD)
                     .then_some(text)
@@ -956,8 +990,8 @@ mod tests {
         let extended_text = format!("{base_text}\n{}", paragraphs("부록추가내용", 40));
         let base_doc = doc("base.hwp", &base_text);
         let mut candidate = doc("different.hwp", &extended_text);
-        assert!(exact_jaccard(&base_doc.shingles, &candidate.shingles) < DEFAULT_NEAR_THRESHOLD);
-        assert!(containment(&candidate.shingles, &base_doc.shingles) >= DEFAULT_NEAR_THRESHOLD);
+        assert!(exact_jaccard(&full(&base_doc), &full(&candidate)) < DEFAULT_NEAR_THRESHOLD);
+        assert!(containment(&full(&candidate), &full(&base_doc)) >= DEFAULT_NEAR_THRESHOLD);
         // Simulate a MinHash overestimate deterministically: final near
         // judgment must still use the complete shingle sets.
         candidate.sig = base_doc.sig.clone();
@@ -1096,7 +1130,7 @@ mod tests {
                 &format!("{}{fragment}{}", noise(21, 60), noise(22, 60)),
             ),
         ];
-        let overlap = crate::near::overlap(&docs[0].shingles, &docs[1].shingles);
+        let overlap = crate::near::overlap(&full(&docs[0]), &full(&docs[1]));
         assert!(
             overlap.max_containment() >= DEFAULT_CONTAINS_THRESHOLD,
             "fixture must be genuinely contained, got {}",
@@ -1138,13 +1172,13 @@ mod tests {
     fn sketch_size_bounded() {
         let big = paragraphs("대형", 2000);
         let d = doc("big.txt", &big);
-        assert_eq!(d.sketch.len(), SKETCH_K);
+        assert_eq!(d.sketch().len(), SKETCH_K);
     }
 
     #[test]
     fn sketch_is_prefix_of_sorted_shingles() {
         let d = doc("a.txt", &paragraphs("x", 20));
-        assert_eq!(d.sketch, d.shingles[..d.sketch.len()].to_vec());
+        assert_eq!(d.sketch(), &full(&d)[..d.sketch().len()]);
     }
 
     #[test]
@@ -1167,10 +1201,10 @@ mod tests {
         assert_eq!(d.exact_hash, exact_hash);
         assert_eq!(d.sig, expected_sig);
         assert_eq!(
-            d.sketch,
-            expected_shingles[..expected_shingles.len().min(SKETCH_K)].to_vec()
+            d.sketch(),
+            &expected_shingles[..expected_shingles.len().min(SKETCH_K)]
         );
-        assert_eq!(d.shingles, expected_shingles);
+        assert_eq!(full(&d), expected_shingles);
     }
 
     #[test]
@@ -1205,7 +1239,7 @@ mod tests {
         }
         let mut df: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
         for &i in &comp {
-            for &h in &docs[i].sketch {
+            for &h in docs[i].sketch() {
                 *df.entry(h).or_default() += 1;
             }
         }
@@ -1220,9 +1254,9 @@ mod tests {
         for (n, &i) in comp.iter().enumerate() {
             for &j in &comp[n + 1..] {
                 let shares_rare_value = docs[i]
-                    .sketch
+                    .sketch()
                     .iter()
-                    .any(|h| df[h] <= MAX_SKETCH_DF && docs[j].sketch.contains(h));
+                    .any(|h| df[h] <= MAX_SKETCH_DF && docs[j].sketch().contains(h));
                 if shares_rare_value && docs[i].exact_hash != docs[j].exact_hash {
                     pairs.insert((i, j));
                 }
@@ -1231,11 +1265,10 @@ mod tests {
         pairs.into_iter().collect()
     }
 
-    #[test]
-    fn streamed_candidates_match_their_definition() {
-        // 70 siblings share one boilerplate (its sketch values are too
-        // common to index), 12 share another (indexed), plus near copies,
-        // exact copies, a draft inside a final, and an empty document.
+    /// 70 siblings share one boilerplate (its sketch values are too common
+    /// to index), 12 share another (indexed), plus near copies, an exact
+    /// copy, a draft inside a final, and an empty document.
+    fn mixed_corpus() -> Vec<ScannedDoc> {
         let mut docs = template_siblings(70, 30, 6);
         let other_boilerplate = noise(2, 30);
         docs.extend((0..12).map(|i| {
@@ -1253,6 +1286,12 @@ mod tests {
             doc("최종.docx", &format!("{}{}", noise(7, 20), noise(8, 4))),
             doc("빈 문서.txt", ""),
         ]);
+        docs
+    }
+
+    #[test]
+    fn streamed_candidates_match_their_definition() {
+        let docs = mixed_corpus();
         let comp: Vec<usize> = (0..docs.len()).filter(|&i| docs[i].comparable()).collect();
         let threshold = MINHASH_CANDIDATE_THRESHOLD;
 
@@ -1264,14 +1303,38 @@ mod tests {
         assert_eq!(streamed, expected);
         // The fixture must exercise the frequency cap, not just pass it.
         let shared = docs[0]
-            .sketch
+            .sketch()
             .iter()
-            .filter(|h| docs[69].sketch.contains(h));
+            .filter(|h| docs[69].sketch().contains(h));
         assert!(shared.count() > 0, "siblings must share sketch values");
         assert!(
             !expected.contains(&(0, 69)),
             "a value held by 70 documents must not make them candidates"
         );
         assert!(expected.contains(&(70, 71)), "12 siblings stay indexed");
+    }
+
+    #[test]
+    fn stored_shingles_cluster_exactly_like_resident_ones() {
+        let resident = mixed_corpus();
+        let store = std::sync::Arc::new(crate::store::ShingleStore::temp().unwrap());
+        let stored: Vec<ScannedDoc> = resident
+            .iter()
+            .map(|d| {
+                let mut d = d.clone();
+                let values = d.shingles.load().unwrap().into_owned();
+                d.shingles = crate::store::Shingles::stored(values, &store).unwrap();
+                d
+            })
+            .collect();
+        assert!(store.bytes_written() > 0, "fixture must actually spill");
+
+        let config = ClusterConfig::default();
+        let expected = cluster(&resident, &config);
+        assert!(expected.len() >= 2, "fixture must form families");
+        assert_eq!(
+            format!("{:?}", cluster(&stored, &config)),
+            format!("{expected:?}")
+        );
     }
 }

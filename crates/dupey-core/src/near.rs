@@ -193,6 +193,25 @@ pub fn overlap_at_least(a: &[u64], b: &[u64], min_shared: usize) -> Option<Overl
     })
 }
 
+/// Exact upper bound on `|A ∩ B|` from sorted prefixes of both sets.
+///
+/// `a_prefix` holds the smallest values of a set of `a_len` values, and
+/// likewise for `b`. Up to the smaller of the two prefix maxima both sets
+/// are fully known, so their overlap there is counted exactly; past it at
+/// most the smaller remainder can still match. The result is never below
+/// the true overlap, and equals it when both prefixes are complete, so a
+/// pair whose bound misses a floor is rejected without its full sets.
+pub fn shared_upper_bound(a_prefix: &[u64], a_len: usize, b_prefix: &[u64], b_len: usize) -> usize {
+    let (Some(&a_max), Some(&b_max)) = (a_prefix.last(), b_prefix.last()) else {
+        return a_len.min(b_len);
+    };
+    let known_up_to = a_max.min(b_max);
+    let a_known = a_prefix.partition_point(|&h| h <= known_up_to);
+    let b_known = b_prefix.partition_point(|&h| h <= known_up_to);
+    let shared = overlap(&a_prefix[..a_known], &b_prefix[..b_known]).shared;
+    shared + (a_len - a_known).min(b_len - b_known)
+}
+
 /// Merge-intersect containment with early exit once `threshold` becomes
 /// reachable or unreachable. containment(a, b) >= threshold ?
 /// Returns the exact containment; callers compare against the threshold.
@@ -388,5 +407,60 @@ mod tests {
         assert!((exact_jaccard(&[1, 2, 3, 4], &[1, 2, 3, 5]) - 0.6).abs() < 1e-9);
         assert_eq!(exact_jaccard(&[], &[]), 1.0);
         assert_eq!(exact_jaccard(&[1], &[]), 0.0);
+    }
+
+    /// Deterministic sorted, deduplicated set: `shared` values common to
+    /// every seed plus `own` values unique to `seed`.
+    fn hash_set(seed: u64, shared: usize, own: usize) -> Vec<u64> {
+        let mix = |x: u64| {
+            let mut h = DefaultHasher::new();
+            x.hash(&mut h);
+            h.finish()
+        };
+        let mut v: Vec<u64> = (0..shared as u64)
+            .map(mix)
+            .chain((0..own as u64).map(|i| mix((seed + 1) << 32 | i)))
+            .collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
+    #[test]
+    fn shared_upper_bound_never_undercounts() {
+        for (seed, shared, own_a, own_b) in [
+            (1, 0, 300, 300),
+            (2, 500, 20, 40),
+            (3, 900, 0, 100),
+            (4, 50, 2_000, 10),
+            (5, 3, 3, 3),
+        ] {
+            let a = hash_set(seed, shared, own_a);
+            let b = hash_set(seed + 100, shared, own_b);
+            let exact = overlap(&a, &b).shared;
+            for pa in [1, 7, 64, a.len() / 3, a.len()] {
+                for pb in [1, 13, 64, b.len() / 2, b.len()] {
+                    let (pa, pb) = (pa.clamp(1, a.len()), pb.clamp(1, b.len()));
+                    let bound = shared_upper_bound(&a[..pa], a.len(), &b[..pb], b.len());
+                    assert!(
+                        bound >= exact,
+                        "bound {bound} < shared {exact} (prefixes {pa}/{pb})"
+                    );
+                    assert!(bound <= a.len().min(b.len()));
+                }
+            }
+            // Complete prefixes leave nothing unknown: the bound is exact.
+            assert_eq!(shared_upper_bound(&a, a.len(), &b, b.len()), exact);
+        }
+    }
+
+    #[test]
+    fn shared_upper_bound_rejects_pairs_that_differ_early() {
+        // Equal sizes, disjoint content: a quarter of each set already
+        // proves at most three quarters can still be shared.
+        let a = hash_set(1, 0, 4_000);
+        let b = hash_set(2, 0, 4_000);
+        let bound = shared_upper_bound(&a[..1_000], a.len(), &b[..1_000], b.len());
+        assert!(bound < 3_300, "bound {bound} should rule out a 0.9 overlap");
     }
 }
