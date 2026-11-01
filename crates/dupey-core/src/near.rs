@@ -44,8 +44,8 @@ impl NearSignature {
 /// Build a 128-wide MinHash over character 5-grams of canonical text.
 pub fn near_sig(text: &str) -> NearSignature {
     let hasher = MinHasher64V1::new(NUM_PERM);
-    let grams = char_ngrams(text, CHAR_NGRAM);
-    let values = hasher.create_signature(grams);
+    let normalized = normalize_for_ngrams(text);
+    let values = hasher.create_signature(char_ngrams(&normalized, CHAR_NGRAM));
     NearSignature { values }
 }
 
@@ -58,17 +58,29 @@ pub fn score(a: &NearSignature, b: &NearSignature) -> f64 {
 /// Sorted vectors make containment a merge intersect, which stays cheap
 /// even on template-heavy corpora with many candidate pairs.
 pub fn shingles(text: &str) -> Vec<u64> {
-    let mut v: Vec<u64> = char_ngrams(text, CHAR_NGRAM)
-        .map(|g| {
-            // DefaultHasher is deterministic across calls; RandomState is
-            // not, and would make cross-document comparison meaningless.
-            let mut h = DefaultHasher::new();
-            g.hash(&mut h);
-            h.finish()
-        })
-        .collect();
+    /// Compact the buffer once it holds this many hashes, so a huge,
+    /// repetitive document never materialises one hash per n-gram.
+    const COMPACT_AT: usize = 1 << 22;
+    let normalized = normalize_for_ngrams(text);
+    let mut v: Vec<u64> = Vec::new();
+    let mut compact_at = COMPACT_AT;
+    for g in char_ngrams(&normalized, CHAR_NGRAM) {
+        // DefaultHasher is deterministic across calls; RandomState is
+        // not, and would make cross-document comparison meaningless.
+        let mut h = DefaultHasher::new();
+        g.hash(&mut h);
+        v.push(h.finish());
+        if v.len() >= compact_at {
+            v.sort_unstable();
+            v.dedup();
+            compact_at = COMPACT_AT.max(v.len() * 2);
+        }
+    }
     v.sort_unstable();
     v.dedup();
+    // Dedup keeps the pre-dedup capacity; every document's shingles stay
+    // resident until clustering ends, so release the slack.
+    v.shrink_to_fit();
     v
 }
 
@@ -206,21 +218,71 @@ pub fn containment_at_least(a: &[u64], b: &[u64], threshold: f64) -> f64 {
     shared as f64 / b.len() as f64
 }
 
-fn char_ngrams(text: &str, n: usize) -> impl Iterator<Item = String> + '_ {
-    let normalized: String = whitespace_split(&text.to_lowercase())
-        .collect::<Vec<_>>()
-        .join(" ");
-    let chars: Vec<char> = normalized.chars().collect();
-    let len = chars.len();
-    let take = if len < n {
-        usize::from(len > 0)
-    } else {
-        len - n + 1
-    };
-    (0..take).map(move |i| {
-        let end = (i + n).min(len);
-        chars[i..end].iter().collect()
-    })
+/// Lowercase, split on ASCII punctuation/whitespace, rejoin with single
+/// spaces. Built in one pass without an intermediate token vector.
+fn normalize_for_ngrams(text: &str) -> String {
+    let lower = text.to_lowercase();
+    let mut out = String::with_capacity(lower.len());
+    for token in whitespace_split(&lower) {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(token);
+    }
+    out
+}
+
+/// Sliding windows of `n` chars over `s` as borrowed slices (a single
+/// shorter window when `s` has fewer than `n` chars, none when empty).
+fn char_ngrams(s: &str, n: usize) -> CharNgrams<'_> {
+    let mut head = s.char_indices();
+    let mut consumed = 0;
+    for _ in 0..n {
+        if head.next().is_none() {
+            break;
+        }
+        consumed += 1;
+    }
+    CharNgrams {
+        s,
+        tail: s.char_indices(),
+        head,
+        short: consumed < n,
+        done: s.is_empty(),
+    }
+}
+
+struct CharNgrams<'a> {
+    s: &'a str,
+    tail: std::str::CharIndices<'a>,
+    /// Positioned `n` chars ahead of `tail`; its next byte offset is the
+    /// end of the current window.
+    head: std::str::CharIndices<'a>,
+    short: bool,
+    done: bool,
+}
+
+impl<'a> Iterator for CharNgrams<'a> {
+    type Item = &'a str;
+
+    fn next(&mut self) -> Option<&'a str> {
+        if self.done {
+            return None;
+        }
+        if self.short {
+            self.done = true;
+            return Some(self.s);
+        }
+        let (start, _) = self.tail.next()?;
+        let end = match self.head.next() {
+            Some((end, _)) => end,
+            None => {
+                self.done = true;
+                self.s.len()
+            }
+        };
+        Some(&self.s[start..end])
+    }
 }
 
 #[cfg(test)]
@@ -262,6 +324,28 @@ mod tests {
     #[test]
     fn empty_text_has_no_shingles() {
         assert!(shingles("").is_empty());
+    }
+
+    #[test]
+    fn ngram_windows_cover_char_boundaries() {
+        fn grams(s: &str) -> Vec<&str> {
+            char_ngrams(s, 5).collect()
+        }
+        assert!(grams("").is_empty());
+        assert_eq!(grams("ab"), ["ab"]);
+        assert_eq!(grams("abcde"), ["abcde"]);
+        assert_eq!(grams("abcdef"), ["abcde", "bcdef"]);
+        assert_eq!(grams("가나다라마바"), ["가나다라마", "나다라마바"]);
+    }
+
+    #[test]
+    fn shingles_dedup_survives_compaction() {
+        // Longer than the compaction threshold with heavy repetition.
+        let text = "abcdefgh ".repeat(700_000);
+        let a = shingles(&text);
+        let b = shingles(&"abcdefgh ".repeat(10));
+        assert_eq!(a, b);
+        assert_eq!(a.capacity(), a.len());
     }
 
     #[test]

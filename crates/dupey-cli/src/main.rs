@@ -5,9 +5,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use dupey_core::{
-    byte_hash_hex, cluster_with_config, containment, exact_hash_hex, extract, near_sig, rank,
-    shingles, CanonicalText, ClusterConfig, Format, MemberSignals, NearSignature, ScannedDoc,
-    DEFAULT_CONTAINS_MIN_JACCARD, DEFAULT_CONTAINS_THRESHOLD, DEFAULT_NEAR_THRESHOLD,
+    byte_hash_hex, cluster_with_config, containment, exact_hash_hex, extract, extract_size_hint,
+    near_sig, rank, shingles, ClusterConfig, DocMeta, Format, MemberSignals, NearSignature,
+    ScannedDoc, DEFAULT_CONTAINS_MIN_JACCARD, DEFAULT_CONTAINS_THRESHOLD, DEFAULT_NEAR_THRESHOLD,
 };
 use serde::Serialize;
 
@@ -179,14 +179,113 @@ struct ScanOut {
     errors: Vec<ErrorEntry>,
 }
 
+/// Everything the scan keeps per file after extraction. The extracted text
+/// itself is dropped as soon as its hashes and shingles exist.
+struct DocInfo {
+    path: PathBuf,
+    format: Format,
+    meta: DocMeta,
+}
+
 struct PreparedScan {
-    canon: CanonicalText,
+    info: DocInfo,
     fs_mtime: Option<jiff::Timestamp>,
     exact_hash: String,
     byte_hash: Option<String>,
+    has_text: bool,
     sig: NearSignature,
     shingles: Vec<u64>,
     chars: usize,
+}
+
+/// Files whose extracted text may exceed this many bytes go to a single
+/// dedicated thread, one at a time. Extract + hash transients (text copies,
+/// MinHash input hashes) run to ~12x the text size, so several such files in
+/// flight at once dominate peak memory. A separate thread, rather than
+/// blocking rayon workers on a semaphore, cannot deadlock when an extractor
+/// itself uses rayon.
+const LARGE_FILE_BYTES: u64 = 8 << 20;
+
+/// Extract, hash, and fingerprint one file. The extracted text is dropped
+/// before returning; only hashes, shingles, and metadata are kept.
+fn prepare(path: &Path) -> dupey_core::Result<PreparedScan> {
+    let canon = extract(path)?;
+    let byte_hash = if canon.text.is_empty() {
+        Some(byte_hash_hex(&std::fs::read(path).map_err(|source| {
+            dupey_core::Error::Io {
+                path: path.to_path_buf(),
+                source,
+            }
+        })?))
+    } else {
+        None
+    };
+    let fs_mtime = std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|d| jiff::SignedDuration::try_from(d).ok())
+        .and_then(|d| jiff::Timestamp::from_duration(d).ok());
+    let exact_hash = exact_hash_hex(&canon.text);
+    let sig = near_sig(&canon.text);
+    let shingles = shingles(&canon.text);
+    let chars = canon.text.chars().count();
+    let has_text = !canon.text.is_empty();
+    Ok(PreparedScan {
+        info: DocInfo {
+            path: canon.path,
+            format: canon.format,
+            meta: canon.meta,
+        },
+        fs_mtime,
+        exact_hash,
+        byte_hash,
+        has_text,
+        sig,
+        shingles,
+        chars,
+    })
+}
+
+/// Prepare every path, keeping results in `paths` order. Small files run on
+/// the rayon pool; large ones are handed to one extra thread as they are
+/// found, so they never overlap each other.
+fn prepare_all(paths: &[PathBuf]) -> Vec<dupey_core::Result<PreparedScan>> {
+    use rayon::prelude::*;
+    let (large_tx, large_rx) = std::sync::mpsc::channel::<usize>();
+    std::thread::scope(|s| {
+        let large_lane = s.spawn(move || {
+            large_rx
+                .into_iter()
+                .map(|i| (i, prepare(&paths[i])))
+                .collect::<Vec<_>>()
+        });
+        let mut results: Vec<Option<dupey_core::Result<PreparedScan>>> = paths
+            .par_iter()
+            .enumerate()
+            .map_with(large_tx, |large_tx, (i, path)| {
+                if extract_size_hint(path) >= LARGE_FILE_BYTES {
+                    large_tx
+                        .send(i)
+                        .expect("large-file lane outlives the small-file pass");
+                    None
+                } else {
+                    Some(prepare(path))
+                }
+            })
+            .collect();
+        // Every sender is dropped once the pass above ends, closing the lane.
+        let large = large_lane
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        for (i, result) in large {
+            results[i] = Some(result);
+        }
+        results
+            .into_iter()
+            .map(|r| r.expect("every path is prepared exactly once"))
+            .collect()
+    })
 }
 
 fn scan(dir: &Path, json: bool, config: ClusterConfig, extra_exclude: &[String]) -> Result<()> {
@@ -195,7 +294,7 @@ fn scan(dir: &Path, json: bool, config: ClusterConfig, extra_exclude: &[String])
     let t0 = std::time::Instant::now();
     let mut files: Vec<FileEntry> = Vec::new();
     let mut docs: Vec<ScannedDoc> = Vec::new();
-    let mut metas: Vec<(CanonicalText, Option<jiff::Timestamp>)> = Vec::new();
+    let mut metas: Vec<(DocInfo, Option<jiff::Timestamp>)> = Vec::new();
     let mut errors: Vec<ErrorEntry> = Vec::new();
 
     let skip = skip::skip_set(extra_exclude);
@@ -215,81 +314,47 @@ fn scan(dir: &Path, json: bool, config: ClusterConfig, extra_exclude: &[String])
 
     // Extract + hash + signature is the scan bottleneck; it is pure I/O
     // and CPU per file, so it parallelizes cleanly. Order is preserved.
-    use rayon::prelude::*;
-    let results: Vec<dupey_core::Result<PreparedScan>> = paths
-        .par_iter()
-        .map(|path| {
-            let canon = extract(path)?;
-            let byte_hash = if canon.text.is_empty() {
-                Some(byte_hash_hex(&std::fs::read(path).map_err(|source| {
-                    dupey_core::Error::Io {
-                        path: path.to_path_buf(),
-                        source,
-                    }
-                })?))
-            } else {
-                None
-            };
-            let fs_mtime = std::fs::metadata(path)
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .and_then(|d| jiff::SignedDuration::try_from(d).ok())
-                .and_then(|d| jiff::Timestamp::from_duration(d).ok());
-            let exact_hash = exact_hash_hex(&canon.text);
-            let sig = near_sig(&canon.text);
-            let shingles = shingles(&canon.text);
-            let chars = canon.text.chars().count();
-            Ok(PreparedScan {
-                canon,
-                fs_mtime,
-                exact_hash,
-                byte_hash,
-                sig,
-                shingles,
-                chars,
-            })
-        })
-        .collect();
+    let results = prepare_all(&paths);
     for (path, result) in paths.iter().zip(results) {
         match result {
             Ok(prepared) => {
                 let PreparedScan {
-                    canon,
+                    info,
                     fs_mtime,
                     exact_hash,
                     byte_hash,
+                    has_text,
                     sig,
                     shingles,
                     chars,
                 } = prepared;
-                let fuzzy = (!canon.text.is_empty()).then(|| sig.values.clone());
+                let fuzzy = has_text.then(|| sig.values.clone());
                 let content_hash = byte_hash.clone().unwrap_or_else(|| exact_hash.clone());
                 files.push(FileEntry {
-                    path: canon.path.display().to_string(),
-                    format: canon.format,
+                    path: info.path.display().to_string(),
+                    format: info.format,
                     content_hash,
                     fuzzy,
                     signals: FileSignals {
                         chars,
-                        modified: canon.meta.modified.map(|t| t.to_string()),
-                        revision: canon.meta.revision,
+                        modified: info.meta.modified.map(|t| t.to_string()),
+                        revision: info.meta.revision,
                         fs_mtime: fs_mtime.map(|t| t.to_string()),
                     },
                 });
                 docs.push(match byte_hash {
                     Some(byte_hash) => ScannedDoc::from_precomputed_with_byte_hash(
-                        canon.path.clone(),
+                        info.path.clone(),
                         byte_hash.clone(),
                         byte_hash,
                         sig,
                         shingles,
                     ),
                     None => {
-                        ScannedDoc::from_precomputed(canon.path.clone(), exact_hash, sig, shingles)
+                        ScannedDoc::from_precomputed(info.path.clone(), exact_hash, sig, shingles)
                     }
                 });
-                metas.push((canon, fs_mtime));
+                metas.push((info, fs_mtime));
             }
             Err(e) => errors.push(ErrorEntry {
                 path: path.display().to_string(),
@@ -315,7 +380,7 @@ fn scan(dir: &Path, json: bool, config: ClusterConfig, extra_exclude: &[String])
                 let (canon, fs_mtime) = metas
                     .iter()
                     .find(|(c, _)| c.path == m.path)
-                    .map(|(c, t)| (c.clone(), *t))
+                    .map(|(c, t)| (c, *t))
                     .expect("family member must come from scanned docs");
                 MemberSignals {
                     path: m.path.clone(),

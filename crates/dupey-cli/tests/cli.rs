@@ -494,3 +494,105 @@ fn scan_continues_after_problem_pdf() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A docx whose text is `text` and whose archive also declares `pad` bytes
+/// of an entry extraction never reads, so its size hint is large while its
+/// extraction stays cheap.
+fn padded_docx(text: &str, pad: usize) -> Vec<u8> {
+    use std::io::Write;
+    let paragraphs: String = text
+        .lines()
+        .map(|l| format!("<w:p><w:r><w:t>{l}</w:t></w:r></w:p>"))
+        .collect();
+    let document = format!(
+        "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">\
+         <w:body>{paragraphs}</w:body></w:document>"
+    );
+    let mut buf = std::io::Cursor::new(Vec::new());
+    {
+        let mut zip = zip::ZipWriter::new(&mut buf);
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        zip.start_file("word/document.xml", opts).unwrap();
+        zip.write_all(document.as_bytes()).unwrap();
+        if pad > 0 {
+            zip.start_file("word/media/padding.bin", opts).unwrap();
+            zip.write_all(&vec![0u8; pad]).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+    buf.into_inner()
+}
+
+#[test]
+fn scan_merges_large_and_small_files_in_path_order() {
+    // Large files are extracted apart from small ones; results must land
+    // back on their own paths, in path order, and still pair across sizes.
+    const LARGE: usize = 16 << 20;
+    let (t1, t2, t3) = (noise(1, 40), noise(2, 40), noise(3, 40));
+    let dir = fixture_dir("size-lanes", &[("f-small.txt", &noise(4, 40))]);
+    for (name, text, pad) in [
+        ("a-large.docx", &t1, LARGE),
+        ("b-small.docx", &t1, 0),
+        ("c-large.docx", &t2, LARGE),
+        ("d-large.docx", &t2, LARGE),
+        ("e-large.docx", &t3, LARGE),
+    ] {
+        std::fs::write(dir.join(name), padded_docx(text, pad)).unwrap();
+    }
+
+    let v = scan_json(&dir);
+    let names: Vec<String> = scanned_paths(&v)
+        .iter()
+        .map(|p| p.rsplit('/').next().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "a-large.docx",
+            "b-small.docx",
+            "c-large.docx",
+            "d-large.docx",
+            "e-large.docx",
+            "f-small.txt"
+        ]
+    );
+    let hashes: Vec<&str> = v["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["content_hash"].as_str().unwrap())
+        .collect();
+    assert_eq!(hashes[0], hashes[1]);
+    assert_eq!(hashes[2], hashes[3]);
+    assert_ne!(hashes[0], hashes[2]);
+    assert_ne!(hashes[4], hashes[0]);
+    assert_ne!(hashes[4], hashes[2]);
+
+    let mut families: Vec<Vec<String>> = v["families"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| {
+            let mut files: Vec<String> = f["files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| p.as_str().unwrap().replace('\\', "/"))
+                .map(|p| p.rsplit('/').next().unwrap().to_string())
+                .collect();
+            files.sort();
+            files
+        })
+        .collect();
+    families.sort();
+    assert_eq!(
+        families,
+        [
+            vec!["a-large.docx", "b-small.docx"],
+            vec!["c-large.docx", "d-large.docx"]
+        ],
+        "{v}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
