@@ -2,13 +2,12 @@
 //! per row. Shared strings are resolved; styles, calcChain, and other
 //! volatile parts are ignored. Provenance from docProps/core.xml.
 
-use std::io::Read;
 use std::path::Path;
 
 use quick_xml::events::Event;
 use quick_xml::Reader;
 
-use super::{normalize_newlines, CanonicalText, DocMeta, Format};
+use super::{normalize_newlines, read_zip_entry, CanonicalText, DocMeta, Format};
 use crate::error::{Error, Result};
 
 pub(crate) fn extract_xlsx(path: &Path) -> Result<CanonicalText> {
@@ -18,14 +17,15 @@ pub(crate) fn extract_xlsx(path: &Path) -> Result<CanonicalText> {
     })?;
     let mut zip = zip::ZipArchive::new(file).map_err(|e| extract_err(path, e))?;
 
-    let shared = read_entry(path, &mut zip, "xl/sharedStrings.xml")
+    let shared = read_zip_entry(path, &mut zip, "xl/sharedStrings.xml")
         .map(|s| shared_strings(&s))
         .unwrap_or_default();
     // Style index -> is-date, so serial date cells become ISO dates
     // instead of locale-dependent numbers.
-    let date_styles: std::collections::HashSet<usize> = read_entry(path, &mut zip, "xl/styles.xml")
-        .map(|s| date_style_indices(&s))
-        .unwrap_or_default();
+    let date_styles: std::collections::HashSet<usize> =
+        read_zip_entry(path, &mut zip, "xl/styles.xml")
+            .map(|s| date_style_indices(&s))
+            .unwrap_or_default();
 
     let mut sheets: Vec<String> = (0..zip.len())
         .filter_map(|i| zip.by_index(i).ok().map(|e| e.name().to_string()))
@@ -35,10 +35,10 @@ pub(crate) fn extract_xlsx(path: &Path) -> Result<CanonicalText> {
 
     let mut text = String::new();
     for name in &sheets {
-        let xml = read_entry(path, &mut zip, name)?;
+        let xml = read_zip_entry(path, &mut zip, name)?;
         text.push_str(&sheet_text(&xml, &shared, &date_styles));
     }
-    let meta = read_entry(path, &mut zip, "docProps/core.xml")
+    let meta = read_zip_entry(path, &mut zip, "docProps/core.xml")
         .map(|c| core_meta(&c))
         .unwrap_or_default();
 
@@ -55,15 +55,6 @@ fn extract_err(path: &Path, e: impl std::fmt::Display) -> Error {
         path: path.to_path_buf(),
         message: e.to_string(),
     }
-}
-
-fn read_entry(path: &Path, zip: &mut zip::ZipArchive<std::fs::File>, name: &str) -> Result<String> {
-    let mut entry = zip.by_name(name).map_err(|e| extract_err(path, e))?;
-    let mut buf = String::new();
-    entry
-        .read_to_string(&mut buf)
-        .map_err(|e| extract_err(path, e))?;
-    Ok(buf)
 }
 
 /// Shared string table: si text in order.

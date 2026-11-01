@@ -62,9 +62,12 @@ pub fn shingles(text: &str) -> Vec<u64> {
     /// repetitive document never materialises one hash per n-gram.
     const COMPACT_AT: usize = 1 << 22;
     let normalized = normalize_for_ngrams(text);
-    let mut v: Vec<u64> = Vec::new();
+    let mut grams = char_ngrams(&normalized, CHAR_NGRAM);
+    // Sized up front: growing by doubling leaves a trail of freed large
+    // blocks that the system allocator may keep cached for the whole scan.
+    let mut v: Vec<u64> = Vec::with_capacity(grams.len().min(COMPACT_AT));
     let mut compact_at = COMPACT_AT;
-    for g in char_ngrams(&normalized, CHAR_NGRAM) {
+    while let Some(g) = grams.next() {
         // DefaultHasher is deterministic across calls; RandomState is
         // not, and would make cross-document comparison meaningless.
         let mut h = DefaultHasher::new();
@@ -74,6 +77,8 @@ pub fn shingles(text: &str) -> Vec<u64> {
             v.sort_unstable();
             v.dedup();
             compact_at = COMPACT_AT.max(v.len() * 2);
+            let wanted = compact_at.min(v.len() + grams.len());
+            v.reserve_exact(wanted.saturating_sub(v.len()));
         }
     }
     v.sort_unstable();
@@ -234,21 +239,24 @@ fn normalize_for_ngrams(text: &str) -> String {
 
 /// Sliding windows of `n` chars over `s` as borrowed slices (a single
 /// shorter window when `s` has fewer than `n` chars, none when empty).
+/// The window count is known up front, so collecting allocates once.
 fn char_ngrams(s: &str, n: usize) -> CharNgrams<'_> {
+    let windows = match s.chars().count() {
+        0 => 0,
+        chars if chars < n => 1,
+        chars => chars - n + 1,
+    };
     let mut head = s.char_indices();
-    let mut consumed = 0;
     for _ in 0..n {
         if head.next().is_none() {
             break;
         }
-        consumed += 1;
     }
     CharNgrams {
         s,
         tail: s.char_indices(),
         head,
-        short: consumed < n,
-        done: s.is_empty(),
+        remaining: windows,
     }
 }
 
@@ -258,32 +266,28 @@ struct CharNgrams<'a> {
     /// Positioned `n` chars ahead of `tail`; its next byte offset is the
     /// end of the current window.
     head: std::str::CharIndices<'a>,
-    short: bool,
-    done: bool,
+    remaining: usize,
 }
 
 impl<'a> Iterator for CharNgrams<'a> {
     type Item = &'a str;
 
     fn next(&mut self) -> Option<&'a str> {
-        if self.done {
+        if self.remaining == 0 {
             return None;
         }
-        if self.short {
-            self.done = true;
-            return Some(self.s);
-        }
+        self.remaining -= 1;
         let (start, _) = self.tail.next()?;
-        let end = match self.head.next() {
-            Some((end, _)) => end,
-            None => {
-                self.done = true;
-                self.s.len()
-            }
-        };
+        let end = self.head.next().map_or(self.s.len(), |(end, _)| end);
         Some(&self.s[start..end])
     }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
 }
+
+impl ExactSizeIterator for CharNgrams<'_> {}
 
 #[cfg(test)]
 mod tests {
@@ -324,6 +328,29 @@ mod tests {
     #[test]
     fn empty_text_has_no_shingles() {
         assert!(shingles("").is_empty());
+    }
+
+    #[test]
+    fn ngram_windows_report_their_exact_count() {
+        // Exact sizes let the MinHash and shingle buffers be allocated once
+        // instead of grown by doubling.
+        for s in [
+            "",
+            "ab",
+            "abcde",
+            "abcdef",
+            "가나다라마바사",
+            "x y z w v u t s",
+        ] {
+            let mut grams = char_ngrams(s, 5);
+            let total = char_ngrams(s, 5).count();
+            assert_eq!(grams.len(), total, "{s:?}");
+            for left in (0..total).rev() {
+                grams.next();
+                assert_eq!(grams.size_hint(), (left, Some(left)), "{s:?}");
+            }
+            assert_eq!(grams.next(), None);
+        }
     }
 
     #[test]

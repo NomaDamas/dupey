@@ -4,13 +4,12 @@
 //! (META-INF, settings, preview images) is ignored. Internal provenance
 //! comes from Contents/content.hpf OPF metadata (dc:date).
 
-use std::io::Read;
 use std::path::Path;
 
 use quick_xml::events::Event;
 use quick_xml::Reader;
 
-use super::{normalize_newlines, CanonicalText, DocMeta, Format};
+use super::{normalize_newlines, read_zip_entry, CanonicalText, DocMeta, Format};
 use crate::error::{Error, Result};
 
 pub(crate) fn extract_hwpx(path: &Path) -> Result<CanonicalText> {
@@ -31,10 +30,10 @@ pub(crate) fn extract_hwpx(path: &Path) -> Result<CanonicalText> {
 
     let mut text = String::new();
     for name in &sections {
-        let xml = read_entry(path, &mut zip, name)?;
+        let xml = read_zip_entry(path, &mut zip, name)?;
         text.push_str(&section_text(&xml));
     }
-    let meta = read_entry(path, &mut zip, "Contents/content.hpf")
+    let meta = read_zip_entry(path, &mut zip, "Contents/content.hpf")
         .map(|hpf| hpf_meta(&hpf))
         .unwrap_or_default();
 
@@ -51,15 +50,6 @@ fn extract_err(path: &Path, e: impl std::fmt::Display) -> Error {
         path: path.to_path_buf(),
         message: e.to_string(),
     }
-}
-
-fn read_entry(path: &Path, zip: &mut zip::ZipArchive<std::fs::File>, name: &str) -> Result<String> {
-    let mut entry = zip.by_name(name).map_err(|e| extract_err(path, e))?;
-    let mut buf = String::new();
-    entry
-        .read_to_string(&mut buf)
-        .map_err(|e| extract_err(path, e))?;
-    Ok(buf)
 }
 
 /// Body text of one section: concat `hp:t`, one line per `hp:p`.

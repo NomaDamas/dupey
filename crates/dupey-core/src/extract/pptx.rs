@@ -2,13 +2,12 @@
 //! order. Speaker notes (ppt/notesSlides) are not body text. Internal
 //! provenance from docProps/core.xml, same as docx.
 
-use std::io::Read;
 use std::path::Path;
 
 use quick_xml::events::Event;
 use quick_xml::Reader;
 
-use super::{normalize_newlines, CanonicalText, DocMeta, Format};
+use super::{normalize_newlines, read_zip_entry, CanonicalText, DocMeta, Format};
 use crate::error::{Error, Result};
 
 pub(crate) fn extract_pptx(path: &Path) -> Result<CanonicalText> {
@@ -26,10 +25,10 @@ pub(crate) fn extract_pptx(path: &Path) -> Result<CanonicalText> {
 
     let mut text = String::new();
     for name in &slides {
-        let xml = read_entry(path, &mut zip, name)?;
+        let xml = read_zip_entry(path, &mut zip, name)?;
         text.push_str(&slide_text(&xml));
     }
-    let meta = read_entry(path, &mut zip, "docProps/core.xml")
+    let meta = read_zip_entry(path, &mut zip, "docProps/core.xml")
         .map(|c| core_meta(&c))
         .unwrap_or_default();
 
@@ -53,15 +52,6 @@ fn extract_err(path: &Path, e: impl std::fmt::Display) -> Error {
         path: path.to_path_buf(),
         message: e.to_string(),
     }
-}
-
-fn read_entry(path: &Path, zip: &mut zip::ZipArchive<std::fs::File>, name: &str) -> Result<String> {
-    let mut entry = zip.by_name(name).map_err(|e| extract_err(path, e))?;
-    let mut buf = String::new();
-    entry
-        .read_to_string(&mut buf)
-        .map_err(|e| extract_err(path, e))?;
-    Ok(buf)
 }
 
 /// a:t runs concatenated, one line per a:p.

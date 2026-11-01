@@ -1,3 +1,4 @@
+mod budget;
 mod skip;
 
 use std::path::{Path, PathBuf};
@@ -198,13 +199,19 @@ struct PreparedScan {
     chars: usize,
 }
 
-/// Files whose extracted text may exceed this many bytes go to a single
-/// dedicated thread, one at a time. Extract + hash transients (text copies,
-/// MinHash input hashes) run to ~12x the text size, so several such files in
-/// flight at once dominate peak memory. A separate thread, rather than
-/// blocking rayon workers on a semaphore, cannot deadlock when an extractor
-/// itself uses rayon.
+/// Files whose extracted text may exceed this many bytes (the file size, or
+/// the declared uncompressed size for ZIP formats) leave the rayon pool for
+/// a few dedicated threads under a byte budget. Extract + hash transients
+/// (text copies, MinHash input hashes) run to ~12x the text size, so several
+/// such files in flight at once dominate peak memory.
 const LARGE_FILE_BYTES: u64 = 8 << 20;
+/// Estimated transient bytes per byte of size hint.
+const TRANSIENT_BYTES_PER_HINT_BYTE: u64 = 12;
+/// Dedicated threads for large files.
+const LARGE_FILE_THREADS: usize = 4;
+/// Estimated transient bytes the large-file threads may have in flight. A
+/// file estimated above it runs alone.
+const LARGE_FILE_BUDGET: u64 = 1 << 30;
 
 /// Extract, hash, and fingerprint one file. The extracted text is dropped
 /// before returning; only hashes, shingles, and metadata are kept.
@@ -248,38 +255,55 @@ fn prepare(path: &Path) -> dupey_core::Result<PreparedScan> {
 }
 
 /// Prepare every path, keeping results in `paths` order. Small files run on
-/// the rayon pool; large ones are handed to one extra thread as they are
-/// found, so they never overlap each other.
+/// the rayon pool; large ones are handed, as they are found, to dedicated
+/// threads that only start one when its estimated transient fits the
+/// budget. Rayon workers never block, so extractors that use rayon
+/// internally cannot deadlock.
 fn prepare_all(paths: &[PathBuf]) -> Vec<dupey_core::Result<PreparedScan>> {
     use rayon::prelude::*;
-    let (large_tx, large_rx) = std::sync::mpsc::channel::<usize>();
+    let (large_tx, large_rx) = std::sync::mpsc::channel::<(usize, u64)>();
+    let large_rx = std::sync::Mutex::new(large_rx);
+    let budget = budget::MemoryBudget::new(LARGE_FILE_BUDGET);
     std::thread::scope(|s| {
-        let large_lane = s.spawn(move || {
-            large_rx
-                .into_iter()
-                .map(|i| (i, prepare(&paths[i])))
-                .collect::<Vec<_>>()
-        });
+        let large_threads: Vec<_> = (0..LARGE_FILE_THREADS)
+            .map(|_| {
+                s.spawn(|| {
+                    let mut done = Vec::new();
+                    loop {
+                        let next = large_rx.lock().unwrap_or_else(|e| e.into_inner()).recv();
+                        let Ok((i, cost)) = next else { break };
+                        let _permit = budget.acquire(cost);
+                        done.push((i, prepare(&paths[i])));
+                    }
+                    done
+                })
+            })
+            .collect();
         let mut results: Vec<Option<dupey_core::Result<PreparedScan>>> = paths
             .par_iter()
             .enumerate()
             .map_with(large_tx, |large_tx, (i, path)| {
-                if extract_size_hint(path) >= LARGE_FILE_BYTES {
+                let hint = extract_size_hint(path);
+                if hint >= LARGE_FILE_BYTES {
+                    let cost = hint.saturating_mul(TRANSIENT_BYTES_PER_HINT_BYTE);
                     large_tx
-                        .send(i)
-                        .expect("large-file lane outlives the small-file pass");
+                        .send((i, cost))
+                        .expect("large-file threads outlive the small-file pass");
                     None
                 } else {
                     Some(prepare(path))
                 }
             })
             .collect();
-        // Every sender is dropped once the pass above ends, closing the lane.
-        let large = large_lane
-            .join()
-            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-        for (i, result) in large {
-            results[i] = Some(result);
+        // Every sender is dropped once the pass above ends, so the large-file
+        // threads drain the channel and stop.
+        for thread in large_threads {
+            let done = thread
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            for (i, result) in done {
+                results[i] = Some(result);
+            }
         }
         results
             .into_iter()

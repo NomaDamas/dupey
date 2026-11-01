@@ -124,8 +124,42 @@ pub fn extract_size_hint(path: &Path) -> u64 {
     file_len.max(declared)
 }
 
+/// CRLF and lone CR become LF. One pass into a buffer sized up front.
 pub(crate) fn normalize_newlines(text: &str) -> String {
-    text.replace("\r\n", "\n").replace('\r', "\n")
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(cr) = rest.find('\r') {
+        out.push_str(&rest[..cr]);
+        out.push('\n');
+        rest = &rest[cr + 1..];
+        rest = rest.strip_prefix('\n').unwrap_or(rest);
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Read one ZIP entry as UTF-8 text into a buffer sized from the entry's
+/// declared length. Growing a large string by doubling instead leaves a
+/// trail of freed blocks the system allocator may keep cached, which on
+/// macOS accumulated to gigabytes across a few large documents.
+pub(crate) fn read_zip_entry(
+    path: &Path,
+    zip: &mut zip::ZipArchive<std::fs::File>,
+    name: &str,
+) -> Result<String> {
+    use std::io::Read;
+    let extract_err = |e: &dyn std::fmt::Display| Error::Extract {
+        path: path.to_path_buf(),
+        message: e.to_string(),
+    };
+    let mut entry = zip.by_name(name).map_err(|e| extract_err(&e))?;
+    let mut buf = String::new();
+    // A declared size is only a hint; if it is absurd, grow as before.
+    let _ = buf.try_reserve_exact(usize::try_from(entry.size()).unwrap_or(0));
+    entry
+        .read_to_string(&mut buf)
+        .map_err(|e| extract_err(&e))?;
+    Ok(buf)
 }
 
 #[cfg(test)]
@@ -153,6 +187,25 @@ mod tests {
         assert!(Format::Hwp.extract_ready());
         assert!(Format::Pptx.extract_ready());
         assert!(Format::Xlsx.extract_ready());
+    }
+
+    #[test]
+    fn newline_normalization_matches_its_definition() {
+        // CRLF first, then any lone CR, as two plain replacements would do.
+        for s in [
+            "",
+            "\r",
+            "\n",
+            "a\r",
+            "\r\r\n",
+            "\r\n\n",
+            "\n\r",
+            "\r\n\r\n",
+            "가\r\n나\r다\n",
+        ] {
+            let expected = s.replace("\r\n", "\n").replace('\r', "\n");
+            assert_eq!(normalize_newlines(s), expected, "{s:?}");
+        }
     }
 
     #[test]

@@ -5,13 +5,12 @@
 //! Internal provenance comes from docProps/core.xml (dcterms:modified,
 //! cp:revision).
 
-use std::io::Read;
 use std::path::Path;
 
 use quick_xml::events::Event;
 use quick_xml::Reader;
 
-use super::{normalize_newlines, CanonicalText, DocMeta, Format};
+use super::{normalize_newlines, read_zip_entry, CanonicalText, DocMeta, Format};
 use crate::error::{Error, Result};
 
 pub(crate) fn extract_docx(path: &Path) -> Result<CanonicalText> {
@@ -20,8 +19,8 @@ pub(crate) fn extract_docx(path: &Path) -> Result<CanonicalText> {
         source,
     })?;
     let mut zip = zip::ZipArchive::new(file).map_err(|e| extract_err(path, e))?;
-    let document_xml = read_entry(path, &mut zip, "word/document.xml")?;
-    let core_xml = read_entry(path, &mut zip, "docProps/core.xml").ok();
+    let document_xml = read_zip_entry(path, &mut zip, "word/document.xml")?;
+    let core_xml = read_zip_entry(path, &mut zip, "docProps/core.xml").ok();
     Ok(CanonicalText {
         path: path.to_path_buf(),
         format: Format::Docx,
@@ -35,15 +34,6 @@ fn extract_err(path: &Path, e: impl std::fmt::Display) -> Error {
         path: path.to_path_buf(),
         message: e.to_string(),
     }
-}
-
-fn read_entry(path: &Path, zip: &mut zip::ZipArchive<std::fs::File>, name: &str) -> Result<String> {
-    let mut entry = zip.by_name(name).map_err(|e| extract_err(path, e))?;
-    let mut buf = String::new();
-    entry
-        .read_to_string(&mut buf)
-        .map_err(|e| extract_err(path, e))?;
-    Ok(buf)
 }
 
 /// Paragraph text from word/document.xml: concat `w:t` runs, one line per
