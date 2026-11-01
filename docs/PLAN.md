@@ -31,6 +31,10 @@ families and an explainable latest candidate.
 - PPTX extraction in slide order, excluding speaker notes
 - XLSX cell extraction with shared strings and serial-date conversion
 - Parallel extraction, hashing, and signature generation with stable ordering
+- Bounded extraction memory: extracted text is dropped once fingerprinted,
+  buffers are sized up front instead of grown by doubling, and files whose
+  size hint exceeds 8 MiB run on four dedicated threads under a 1 GiB
+  estimated-transient budget
 - Live end-to-end fixtures, Criterion benchmarks, and corpus benchmarks
 
 ## Next
