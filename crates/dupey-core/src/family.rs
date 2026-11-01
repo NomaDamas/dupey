@@ -224,11 +224,6 @@ pub fn cluster(docs: &[ScannedDoc], threshold: f64) -> Vec<Family> {
 pub fn cluster_with_config(docs: &[ScannedDoc], config: &ClusterConfig) -> Vec<Family> {
     let threshold = config.near_threshold;
     let candidate_threshold = MINHASH_CANDIDATE_THRESHOLD.min(threshold);
-    // gaoya requires bands x width == signature length (128). 16x8
-    // retrieves a MinHash-0.8 pair with ~94.7% probability while
-    // suppressing the much larger population below the candidate gate.
-    const LSH_BANDS: usize = 16;
-    const LSH_BAND_WIDTH: usize = 8;
     let comp: Vec<usize> = (0..docs.len()).filter(|&i| docs[i].comparable()).collect();
     let mut uf = UnionFind::new(docs.len());
 
@@ -262,51 +257,7 @@ pub fn cluster_with_config(docs: &[ScannedDoc], config: &ClusterConfig) -> Vec<F
     // near / contains: candidate generation, every candidate verified.
     // LSH covers near; a bottom-k inverted index covers containment of
     // documents too small for LSH bands to see (draft inside final).
-    let mut index =
-        gaoya::minhash::MinHashIndex::new(LSH_BANDS, LSH_BAND_WIDTH, candidate_threshold);
-    for &i in &comp {
-        index.insert(i, docs[i].sig.values.clone());
-    }
-
-    let mut sketch_postings: std::collections::HashMap<u64, Vec<usize>> =
-        std::collections::HashMap::new();
-    for &i in &comp {
-        for &h in &docs[i].sketch {
-            sketch_postings.entry(h).or_default().push(i);
-        }
-    }
-    // Drop ubiquitous sketch values (padding shingles, shared
-    // boilerplate): containment at 0.9 needs hundreds of shared
-    // shingles, so a value present in many docs discriminates nothing.
-    // The 64-doc cap keeps draft-vs-many-revisions queries intact.
-    let max_df = 64;
-    sketch_postings.retain(|_, posting| posting.len() <= max_df);
-
-    let mut candidates: std::collections::BTreeSet<(usize, usize)> =
-        std::collections::BTreeSet::new();
-    for &i in &comp {
-        for &j in index.query(&docs[i].sig.values) {
-            if j != i {
-                candidates.insert((i.min(j), i.max(j)));
-            }
-        }
-    }
-    for &i in &comp {
-        for &h in &docs[i].sketch {
-            if let Some(posting) = sketch_postings.get(&h) {
-                for &j in posting {
-                    // Skip pairs already unioned as exact copies; popular
-                    // sketch values otherwise make candidate collection
-                    // quadratic on template-heavy corpora.
-                    if j != i && uf.find(i) != uf.find(j) {
-                        candidates.insert((i.min(j), i.max(j)));
-                    }
-                }
-            }
-        }
-    }
-
-    let candidates: Vec<(usize, usize)> = candidates.into_iter().collect();
+    let candidates = CandidateIndex::build(docs, &comp, candidate_threshold);
 
     let mut edges: Vec<VerifiedEdge> = Vec::new();
     for &i in &comp {
@@ -331,14 +282,21 @@ pub fn cluster_with_config(docs: &[ScannedDoc], config: &ClusterConfig) -> Vec<F
     // sequentially in sorted order. Chunking keeps the sequential loop's
     // best optimisation -- skipping pairs already joined by an earlier
     // merge -- while still filling every core. Chunk size is a constant and
-    // the candidate list is sorted, so the outcome never depends on thread
-    // scheduling or on how many threads rayon happens to use.
+    // candidates arrive in ascending order, so the outcome never depends on
+    // thread scheduling or on how many threads rayon happens to use.
     const VERIFY_CHUNK: usize = 512;
     // A merge intersect costs about one pass over both shingle vectors.
     // Below this much total work, rayon's fork/join costs more than the
     // comparisons it spreads out, so short documents stay on one thread.
     const PARALLEL_MIN_WORK: usize = 1 << 20;
-    for chunk in candidates.chunks(VERIFY_CHUNK) {
+    let mut pairs = candidates.pairs(docs, &comp);
+    let mut chunk: Vec<(usize, usize)> = Vec::with_capacity(VERIFY_CHUNK);
+    loop {
+        chunk.clear();
+        chunk.extend(pairs.by_ref().take(VERIFY_CHUNK));
+        if chunk.is_empty() {
+            break;
+        }
         let pending: Vec<(usize, usize)> = chunk
             .iter()
             .copied()
@@ -359,6 +317,8 @@ pub fn cluster_with_config(docs: &[ScannedDoc], config: &ClusterConfig) -> Vec<F
             edges.push(edge);
         }
     }
+    drop(pairs);
+    drop(candidates);
 
     // Components with 2+ members become families.
     let mut components: std::collections::HashMap<usize, Vec<usize>> =
@@ -410,6 +370,104 @@ pub fn cluster_with_config(docs: &[ScannedDoc], config: &ClusterConfig) -> Vec<F
         .collect();
     families.sort_by_key(|f| f.id);
     families
+}
+
+// gaoya requires bands x width == signature length (128). 16x8 retrieves a
+// MinHash-0.8 pair with ~94.7% probability while suppressing the much larger
+// population below the candidate gate.
+const LSH_BANDS: usize = 16;
+const LSH_BAND_WIDTH: usize = 8;
+
+/// Sketch values held by more documents than this are not indexed.
+///
+/// Ubiquitous values (padding shingles, shared boilerplate) discriminate
+/// nothing: containment needs hundreds of shared shingles. The cap still
+/// keeps draft-vs-many-revisions queries intact.
+const MAX_SKETCH_DF: usize = 64;
+
+/// Candidate pairs for near/contains verification.
+///
+/// Pairs come out one document at a time, in ascending `(i, j)` order and
+/// without duplicates, so the full candidate set -- tens of millions of
+/// pairs on large corpora -- never exists in memory at once.
+struct CandidateIndex {
+    lsh: gaoya::minhash::MinHashIndex<u64, u32, gaoya::minhash::VecContainer<u32>>,
+    /// `(sketch value, document)` sorted by value, rare values only.
+    postings: Vec<(u64, u32)>,
+}
+
+impl CandidateIndex {
+    fn build(docs: &[ScannedDoc], comp: &[usize], candidate_threshold: f64) -> Self {
+        let mut lsh =
+            gaoya::minhash::MinHashIndex::new_index(LSH_BANDS, LSH_BAND_WIDTH, candidate_threshold);
+        for &i in comp {
+            lsh.insert(doc_id(i), docs[i].sig.values.clone());
+        }
+
+        let mut postings: Vec<(u64, u32)> = comp
+            .iter()
+            .flat_map(|&i| docs[i].sketch.iter().map(move |&h| (h, doc_id(i))))
+            .collect();
+        postings.sort_unstable();
+        let mut kept = 0;
+        let mut start = 0;
+        while start < postings.len() {
+            let value = postings[start].0;
+            let end = start + postings[start..].partition_point(|&(h, _)| h == value);
+            if end - start <= MAX_SKETCH_DF {
+                postings.copy_within(start..end, kept);
+                kept += end - start;
+            }
+            start = end;
+        }
+        postings.truncate(kept);
+        postings.shrink_to_fit();
+        Self { lsh, postings }
+    }
+
+    fn pairs<'a>(
+        &'a self,
+        docs: &'a [ScannedDoc],
+        comp: &'a [usize],
+    ) -> impl Iterator<Item = (usize, usize)> + 'a {
+        comp.iter()
+            .flat_map(move |&i| self.partners(docs, i).into_iter().map(move |j| (i, j)))
+    }
+
+    /// Candidates `j > i` for document `i`, ascending and deduplicated.
+    /// Both sources are symmetric, so listing only larger partners yields
+    /// every pair exactly once.
+    fn partners(&self, docs: &[ScannedDoc], i: usize) -> Vec<usize> {
+        let mut partners: Vec<usize> = self
+            .lsh
+            .query(&docs[i].sig.values)
+            .into_iter()
+            .map(|&j| j as usize)
+            .filter(|&j| j > i)
+            .collect();
+        for &h in &docs[i].sketch {
+            let start = self.postings.partition_point(|&(value, _)| value < h);
+            for &(value, j) in &self.postings[start..] {
+                if value != h {
+                    break;
+                }
+                let j = j as usize;
+                // Skip exact copies: they are already joined, and popular
+                // sketch values otherwise make candidate collection
+                // quadratic on template-heavy corpora.
+                if j > i && docs[i].exact_hash != docs[j].exact_hash {
+                    partners.push(j);
+                }
+            }
+        }
+        partners.sort_unstable();
+        partners.dedup();
+        partners
+    }
+}
+
+fn doc_id(i: usize) -> u32 {
+    u32::try_from(i).expect("dupey indexes at most u32::MAX documents")
 }
 
 /// Verify one candidate pair against both relations.
@@ -1134,5 +1192,86 @@ mod tests {
         assert_eq!(sizes, vec![2, 2]);
         // IDs are stable and unique.
         assert_ne!(fams[0].id, fams[1].id);
+    }
+
+    /// Candidate pairs straight from their definition, quadratically:
+    /// LSH neighbours (stock gaoya index) plus pairs sharing a sketch value
+    /// held by at most `MAX_SKETCH_DF` documents, exact copies excluded.
+    fn reference_candidates(docs: &[ScannedDoc], threshold: f64) -> Vec<(usize, usize)> {
+        let comp: Vec<usize> = (0..docs.len()).filter(|&i| docs[i].comparable()).collect();
+        let mut lsh = gaoya::minhash::MinHashIndex::new(LSH_BANDS, LSH_BAND_WIDTH, threshold);
+        for &i in &comp {
+            lsh.insert(i, docs[i].sig.values.clone());
+        }
+        let mut df: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+        for &i in &comp {
+            for &h in &docs[i].sketch {
+                *df.entry(h).or_default() += 1;
+            }
+        }
+        let mut pairs = std::collections::BTreeSet::new();
+        for &i in &comp {
+            for &j in lsh.query(&docs[i].sig.values) {
+                if j != i {
+                    pairs.insert((i.min(j), i.max(j)));
+                }
+            }
+        }
+        for (n, &i) in comp.iter().enumerate() {
+            for &j in &comp[n + 1..] {
+                let shares_rare_value = docs[i]
+                    .sketch
+                    .iter()
+                    .any(|h| df[h] <= MAX_SKETCH_DF && docs[j].sketch.contains(h));
+                if shares_rare_value && docs[i].exact_hash != docs[j].exact_hash {
+                    pairs.insert((i, j));
+                }
+            }
+        }
+        pairs.into_iter().collect()
+    }
+
+    #[test]
+    fn streamed_candidates_match_their_definition() {
+        // 70 siblings share one boilerplate (its sketch values are too
+        // common to index), 12 share another (indexed), plus near copies,
+        // exact copies, a draft inside a final, and an empty document.
+        let mut docs = template_siblings(70, 30, 6);
+        let other_boilerplate = noise(2, 30);
+        docs.extend((0..12).map(|i| {
+            doc(
+                &format!("서식_{i}.docx"),
+                &format!("{other_boilerplate}{}", noise(500 + i, 6)),
+            )
+        }));
+        let p = proposal();
+        docs.extend([
+            doc("제안서.docx", &p),
+            doc("제안서_수정.docx", &p.replace("3,200만 원", "3,500만 원")),
+            doc("제안서 사본.docx", &p),
+            doc("초안.docx", &noise(7, 20)),
+            doc("최종.docx", &format!("{}{}", noise(7, 20), noise(8, 4))),
+            doc("빈 문서.txt", ""),
+        ]);
+        let comp: Vec<usize> = (0..docs.len()).filter(|&i| docs[i].comparable()).collect();
+        let threshold = MINHASH_CANDIDATE_THRESHOLD;
+
+        let streamed: Vec<(usize, usize)> = CandidateIndex::build(&docs, &comp, threshold)
+            .pairs(&docs, &comp)
+            .collect();
+
+        let expected = reference_candidates(&docs, threshold);
+        assert_eq!(streamed, expected);
+        // The fixture must exercise the frequency cap, not just pass it.
+        let shared = docs[0]
+            .sketch
+            .iter()
+            .filter(|h| docs[69].sketch.contains(h));
+        assert!(shared.count() > 0, "siblings must share sketch values");
+        assert!(
+            !expected.contains(&(0, 69)),
+            "a value held by 70 documents must not make them candidates"
+        );
+        assert!(expected.contains(&(70, 71)), "12 siblings stay indexed");
     }
 }

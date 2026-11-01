@@ -23,6 +23,9 @@ families and an explainable latest candidate.
   documents, including a document-frequency filter
 - Candidate verification of both relations in one merge-intersection with an
   exact early exit, run in parallel over candidate chunks
+- Candidates generated one document at a time in ascending pair order, so
+  the full candidate set is never held in memory; `scan --json` streams to
+  stdout
 - Latest-candidate ranking by modification time only: internal timestamp
   first, filesystem timestamp second
 - Stable public contract through `dupey scan DIR --json`
