@@ -4,6 +4,9 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use dupey_core::visual::{
+    cluster_images, fingerprint, PerceptualHash, ScannedImage, DEFAULT_IMAGE_THRESHOLD,
+};
 use dupey_core::{cluster_with_config, extract, near_sig, score, ClusterConfig, ScannedDoc};
 
 fn paragraphs(prefix: &str, n: usize) -> String {
@@ -124,5 +127,85 @@ fn bench_cluster(c: &mut Criterion) {
     g.finish();
 }
 
-criterion_group!(benches, bench_extract, bench_near, bench_cluster);
+/// Seeded hashes: every tenth image is a 4-bit variant of an earlier one, the
+/// rest are unrelated, like a photo library with some re-exports.
+fn image_corpus(n: usize) -> Vec<ScannedImage> {
+    let mut state = 0x2545_F491_4F6C_DD1Du64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let mut hashes: Vec<u128> = Vec::with_capacity(n);
+    for i in 0..n {
+        let h = if i % 10 == 9 {
+            let mut h = hashes[(next() as usize) % hashes.len()];
+            for _ in 0..4 {
+                h ^= 1u128 << (next() % 128);
+            }
+            h
+        } else {
+            u128::from(next()) << 64 | u128::from(next())
+        };
+        hashes.push(h);
+    }
+    hashes
+        .into_iter()
+        .enumerate()
+        .map(|(i, h)| ScannedImage {
+            path: PathBuf::from(format!("i{i}.jpg")),
+            exact_hash: format!("{i:064x}"),
+            hash: Some(PerceptualHash(h)),
+        })
+        .collect()
+}
+
+fn bench_images(c: &mut Criterion) {
+    // A 12 MP gradient-and-noise JPEG: decode + one hashing pass.
+    let img = image::RgbImage::from_fn(4000, 3000, |x, y| {
+        let n = (x.wrapping_mul(2654435761) ^ y.wrapping_mul(40503)) >> 24;
+        image::Rgb([(x / 16) as u8, (y / 12) as u8, (n & 0x3f) as u8])
+    });
+    let path = tmp("bench-12mp.jpg", &[]);
+    img.save(&path).unwrap();
+    let mut g = c.benchmark_group("image");
+    g.sample_size(10);
+    g.bench_function("fingerprint_12mp_jpeg", |b| {
+        b.iter(|| fingerprint(&path).unwrap())
+    });
+    g.finish();
+
+    let mut g = c.benchmark_group("image_cluster");
+    g.sample_size(10);
+    for &n in &[10_000usize, 100_000, 1_000_000] {
+        let images = image_corpus(n);
+        g.bench_with_input(BenchmarkId::new("multi_index", n), &images, |b, images| {
+            b.iter(|| cluster_images(images, DEFAULT_IMAGE_THRESHOLD))
+        });
+    }
+    // All-pairs popcount, for scale: what multi-index hashing replaces.
+    let images = image_corpus(10_000);
+    let hashes: Vec<u128> = images.iter().map(|i| i.hash.unwrap().0).collect();
+    g.bench_function(BenchmarkId::new("all_pairs", 10_000), |b| {
+        b.iter(|| {
+            let mut close = 0usize;
+            for i in 0..hashes.len() {
+                for j in i + 1..hashes.len() {
+                    close += ((hashes[i] ^ hashes[j]).count_ones() <= 12) as usize;
+                }
+            }
+            close
+        })
+    });
+    g.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_extract,
+    bench_near,
+    bench_cluster,
+    bench_images
+);
 criterion_main!(benches);

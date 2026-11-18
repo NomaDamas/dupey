@@ -4,8 +4,69 @@
 //! N (default 1) scales the filler document count for benchmarks; the
 //! named family fixtures are always written.
 
-use std::io::Write;
+use std::io::{Cursor, Write};
 use std::path::Path;
+
+use image::codecs::jpeg::JpegEncoder;
+use image::imageops::{self, FilterType};
+use image::{DynamicImage, ImageFormat, Rgb, RgbImage};
+
+/// Seeded structured picture; different seeds are unrelated scenes.
+fn scene(seed: u64, w: u32, h: u32) -> RgbImage {
+    let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    let mut next = move || {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (state >> 33) as u32
+    };
+    let (fx, fy) = (1.0 + (next() % 5) as f32, 1.0 + (next() % 5) as f32);
+    let base = [
+        (next() % 200) as f32,
+        (next() % 200) as f32,
+        (next() % 200) as f32,
+    ];
+    let mut img = RgbImage::from_fn(w, h, |x, y| {
+        let (u, v) = (x as f32 / w as f32, y as f32 / h as f32);
+        let wave =
+            ((u * fx * std::f32::consts::TAU).sin() * (v * fy * std::f32::consts::TAU).cos() + 1.0)
+                * 28.0;
+        Rgb([
+            (base[0] + wave) as u8,
+            (base[1] + wave * 0.8) as u8,
+            (base[2] + wave * 1.2) as u8,
+        ])
+    });
+    for _ in 0..7 {
+        let (x0, y0) = (next() % w, next() % h);
+        let (bw, bh) = (w / 6 + next() % (w / 3), h / 6 + next() % (h / 3));
+        let colour = Rgb([
+            (next() % 256) as u8,
+            (next() % 256) as u8,
+            (next() % 256) as u8,
+        ]);
+        for y in y0..(y0 + bh).min(h) {
+            for x in x0..(x0 + bw).min(w) {
+                img.put_pixel(x, y, colour);
+            }
+        }
+    }
+    img
+}
+
+fn write_image(path: &Path, img: &RgbImage, format: ImageFormat) {
+    DynamicImage::ImageRgb8(img.clone())
+        .save_with_format(path, format)
+        .unwrap();
+}
+
+fn write_jpeg(path: &Path, img: &RgbImage, quality: u8) {
+    let mut bytes = Vec::new();
+    JpegEncoder::new_with_quality(Cursor::new(&mut bytes), quality)
+        .encode_image(img)
+        .unwrap();
+    std::fs::write(path, bytes).unwrap();
+}
 
 const PROPOSAL: &[&str] = &[
     "프로젝트 제안서",
@@ -430,6 +491,26 @@ fn main() {
         &strings,
         &rows_v2,
         "2026-08-04T09:00:00Z",
+    );
+
+    // Image family: lossless re-save (exact pixels), a downscaled JPEG
+    // (near), an unrelated picture, and two solid-colour images (no detail:
+    // exact-only, so black and white never merge).
+    let photo = scene(7, 640, 480);
+    write_image(&dir.join("사진.png"), &photo, ImageFormat::Png);
+    write_image(&dir.join("사진_복사본.bmp"), &photo, ImageFormat::Bmp);
+    let small = imageops::resize(&photo, 320, 240, FilterType::Lanczos3);
+    write_jpeg(&dir.join("사진_축소.jpg"), &small, 75);
+    write_image(&dir.join("풍경.png"), &scene(8, 640, 480), ImageFormat::Png);
+    write_image(
+        &dir.join("검정.png"),
+        &RgbImage::from_pixel(64, 64, Rgb([0, 0, 0])),
+        ImageFormat::Png,
+    );
+    write_image(
+        &dir.join("흰색.png"),
+        &RgbImage::from_pixel(64, 64, Rgb([255, 255, 255])),
+        ImageFormat::Png,
     );
 
     // Unrelated doc and a scanned-style PDF (no embedded text).

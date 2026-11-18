@@ -41,6 +41,11 @@ with one or two changed lines often score **0.85-0.99**. Family clustering
 starts at **0.90** by default. Different documents that use the same corporate
 template may fall around 0.6-0.8.
 
+Images are the one non-text format. They are decoded first, then compared by
+SHA-256 of the RGBA pixels (exact) and a 128-bit perceptual hash (near,
+found through multi-index hashing). This is classical signal hashing, not a
+learned embedding; see the README for its limits.
+
 MinHash is never computed over raw file bytes. Formats such as DOCX are ZIP
 containers whose bytes can change on every save even when their content does
 not.
@@ -57,7 +62,8 @@ Scoring is shared. New format support belongs in extraction.
 | `xlsx` | Cell values | Styles and calculation chains | Available |
 | `pdf` | Embedded text | Creation metadata | Available |
 | `hwp`, `hwpx` | Body text | Presentation metadata | Available |
-| Scanned PDF, image | No comparable text without OCR | N/A | Excluded |
+| Scanned PDF | No comparable text without OCR | N/A | Excluded |
+| `png`, `jpg`, `gif`, `bmp`, `webp`, `tif` | Decoded pixels | EXIF, container metadata | Available (perceptual hash, not text) |
 
 ## Latest-version signals, not certainty
 

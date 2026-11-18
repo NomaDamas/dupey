@@ -49,12 +49,16 @@ pub struct FamilyEdge {
     pub a: PathBuf,
     /// For `contains`, the document living inside `a`.
     pub b: PathBuf,
-    /// MinHash Jaccard estimate for the pair.
+    /// MinHash Jaccard estimate for a text pair; perceptual-hash similarity
+    /// (`1 - hamming / 128`) for an image pair.
     pub near_score: f64,
-    /// Exact shingle Jaccard for the pair.
-    pub jaccard: f64,
-    /// `|a ∩ b| / |b|`: how much of `b` lives inside `a`.
-    pub containment: f64,
+    /// Exact shingle Jaccard for a text pair; `None` for images.
+    pub jaccard: Option<f64>,
+    /// `|a ∩ b| / |b|`: how much of `b` lives inside `a`. `None` for images.
+    pub containment: Option<f64>,
+    /// Perceptual-hash Hamming distance for an image pair, in bits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hamming: Option<u32>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -72,6 +76,9 @@ pub struct FamilyMember {
     pub jaccard: Option<f64>,
     /// Shingle containment against `joined_with`.
     pub containment: Option<f64>,
+    /// Perceptual-hash Hamming distance to `joined_with` (images only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hamming: Option<u32>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -603,8 +610,9 @@ impl VerifiedEdge {
             a: docs[self.a].path.clone(),
             b: docs[self.b].path.clone(),
             near_score: self.near_score,
-            jaccard: self.jaccard,
-            containment: self.containment,
+            jaccard: Some(self.jaccard),
+            containment: Some(self.containment),
+            hamming: None,
         }
     }
 }
@@ -633,6 +641,7 @@ fn member_from_edges(docs: &[ScannedDoc], i: usize, edges: &[VerifiedEdge]) -> F
             near_score: Some(edge.near_score),
             jaccard: Some(edge.jaccard),
             containment: Some(edge.containment),
+            hamming: None,
         },
         None => FamilyMember {
             path: docs[i].path.clone(),
@@ -642,29 +651,30 @@ fn member_from_edges(docs: &[ScannedDoc], i: usize, edges: &[VerifiedEdge]) -> F
             near_score: None,
             jaccard: None,
             containment: None,
+            hamming: None,
         },
     }
 }
 
-struct UnionFind {
+pub(crate) struct UnionFind {
     parent: Vec<usize>,
 }
 
 impl UnionFind {
-    fn new(n: usize) -> Self {
+    pub(crate) fn new(n: usize) -> Self {
         Self {
             parent: (0..n).collect(),
         }
     }
 
-    fn find(&mut self, x: usize) -> usize {
+    pub(crate) fn find(&mut self, x: usize) -> usize {
         if self.parent[x] != x {
             self.parent[x] = self.find(self.parent[x]);
         }
         self.parent[x]
     }
 
-    fn union(&mut self, a: usize, b: usize) {
+    pub(crate) fn union(&mut self, a: usize, b: usize) {
         let (ra, rb) = (self.find(a), self.find(b));
         if ra != rb {
             self.parent[rb.max(ra)] = ra.min(rb);
@@ -813,8 +823,8 @@ mod tests {
         assert_eq!(edge.relation, Relation::Contains);
         assert_eq!(edge.a, PathBuf::from("최종.docx"), "a is the container");
         assert_eq!(edge.b, PathBuf::from("초안.docx"), "b is the contained");
-        assert!(edge.containment >= DEFAULT_CONTAINS_THRESHOLD);
-        assert!(edge.jaccard < DEFAULT_NEAR_THRESHOLD);
+        assert!(edge.containment.unwrap() >= DEFAULT_CONTAINS_THRESHOLD);
+        assert!(edge.jaccard.unwrap() < DEFAULT_NEAR_THRESHOLD);
     }
 
     #[test]
@@ -886,7 +896,7 @@ mod tests {
         assert_eq!(families[0].label(), FamilyLabel::Exact);
         assert_eq!(families[0].edges.len(), 1);
         assert_eq!(families[0].edges[0].relation, Relation::Exact);
-        assert_eq!(families[0].edges[0].jaccard, 1.0);
+        assert_eq!(families[0].edges[0].jaccard, Some(1.0));
     }
 
     #[test]
