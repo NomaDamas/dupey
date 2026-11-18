@@ -168,7 +168,7 @@ pub fn max_distance(threshold: f64) -> u32 {
 /// decoder; HEIC/HEIF (HEVC) is deliberately not supported.
 pub fn fingerprint(path: &Path) -> Result<ImageFingerprint> {
     let img = if is_avif(path) {
-        decode_avif(path, MAX_DECODED_BYTES)?
+        decode_avif_guarded(path, MAX_DECODED_BYTES)?
     } else {
         decode_raster(path)?
     };
@@ -248,6 +248,20 @@ fn avif_probe(path: &Path) -> Result<zenavif::ImageInfo> {
             path: path.to_path_buf(),
             message: format!("avif: {e:?}"),
         })
+}
+
+/// [`decode_avif`] with decoder panics turned into errors.
+///
+/// The AV1 decoder indexes out of bounds on some real files (ImageMagick
+/// 4:4:4 screenshots hit its loop-restoration SIMD). One such file must
+/// cost one `errors[]` entry, not the whole scan.
+fn decode_avif_guarded(path: &Path, max_bytes: u64) -> Result<DynamicImage> {
+    std::panic::catch_unwind(|| decode_avif(path, max_bytes)).unwrap_or_else(|_| {
+        Err(Error::Extract {
+            path: path.to_path_buf(),
+            message: "avif: decoder crashed on this file".into(),
+        })
+    })
 }
 
 /// Decode an AVIF to 8/16-bit pixels with `irot`/`imir` applied. Rotation

@@ -603,3 +603,13 @@ fn svt_av1_encoded_avif_of_simple_content_matches_its_source() {
         assert!(sim >= DEFAULT_IMAGE_THRESHOLD, "{name}: {sim:.3}");
     }
 }
+
+#[test]
+fn avif_that_crashes_the_decoder_is_an_error_not_a_panic() {
+    // A real 9 KB ImageMagick/libheif-written screenshot that makes the
+    // decoder index out of bounds in its loop-restoration code. One such
+    // file must not take down a whole scan.
+    let err = fingerprint(&fixture("decoder_panic.avif"));
+    assert!(err.is_err(), "expected a decode error, got {err:?}");
+    assert!(err.unwrap_err().to_string().contains("decoder crashed"));
+}
