@@ -37,6 +37,7 @@ pub enum Format {
     Bmp,
     Webp,
     Tiff,
+    Avif,
 }
 
 impl Format {
@@ -57,6 +58,7 @@ impl Format {
             "bmp" => Some(Self::Bmp),
             "webp" => Some(Self::Webp),
             "tif" | "tiff" => Some(Self::Tiff),
+            "avif" => Some(Self::Avif),
             _ => None,
         }
     }
@@ -66,7 +68,7 @@ impl Format {
     pub fn is_image(self) -> bool {
         matches!(
             self,
-            Self::Png | Self::Jpeg | Self::Gif | Self::Bmp | Self::Webp | Self::Tiff
+            Self::Png | Self::Jpeg | Self::Gif | Self::Bmp | Self::Webp | Self::Tiff | Self::Avif
         )
     }
 
@@ -118,12 +120,16 @@ pub fn extract(path: &Path) -> Result<CanonicalText> {
         Format::Pptx => pptx::extract_pptx(path),
         Format::Xlsx => xlsx::extract_xlsx(path),
         Format::Pdf => pdf::extract_pdf(path),
-        Format::Png | Format::Jpeg | Format::Gif | Format::Bmp | Format::Webp | Format::Tiff => {
-            Err(Error::Extract {
-                path: path.to_path_buf(),
-                message: "images have no text; fingerprint them with dupey_core::visual".into(),
-            })
-        }
+        Format::Png
+        | Format::Jpeg
+        | Format::Gif
+        | Format::Bmp
+        | Format::Webp
+        | Format::Tiff
+        | Format::Avif => Err(Error::Extract {
+            path: path.to_path_buf(),
+            message: "images have no text; fingerprint them with dupey_core::visual".into(),
+        }),
     }
 }
 

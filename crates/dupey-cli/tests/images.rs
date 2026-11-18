@@ -396,3 +396,140 @@ fn many_images_scan_into_the_expected_families() {
         .all(|f| f["files"].as_array().unwrap().len() == 2));
     assert!(families.iter().all(|f| f["relation"] == "exact"));
 }
+
+fn avif_fixture(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../dupey-core/tests/fixtures/avif")
+        .join(name)
+}
+
+fn avif_dir(name: &str) -> PathBuf {
+    let dir = fresh_dir(name);
+    for (from, to) in [
+        ("scene.png", "scene.png"),
+        ("scene_q60.avif", "scene_q60.avif"),
+        ("orient6.avif", "phone_photo.avif"),
+        ("orient5.avif", "phone_photo_transposed.avif"),
+    ] {
+        std::fs::copy(avif_fixture(from), dir.join(to)).unwrap();
+    }
+    save(&dir, "other.png", &scene(9, 192, 128), ImageFormat::Png);
+    dir
+}
+
+#[test]
+fn scan_groups_avif_with_its_png_source_including_rotated_avifs() {
+    let dir = avif_dir("avif-scan");
+    let v = scan_json(&dir, &[]);
+    let families = v["families"].as_array().unwrap();
+    assert_eq!(families.len(), 1, "{families:#?}");
+    assert_eq!(
+        names(&families[0]),
+        [
+            "phone_photo.avif",
+            "phone_photo_transposed.avif",
+            "scene.png",
+            "scene_q60.avif"
+        ]
+    );
+    let avif = file(&v, "scene_q60.avif");
+    assert_eq!(avif["format"], "avif");
+    assert_eq!(avif["image_hash"].as_str().unwrap().len(), 32);
+    assert_eq!(avif["signals"]["width"], 192);
+    assert_eq!(file(&v, "phone_photo.avif")["signals"]["height"], 128);
+}
+
+#[test]
+fn compare_and_fingerprint_work_on_avif() {
+    let dir = avif_dir("avif-compare");
+    let out = dupey()
+        .arg("compare")
+        .arg(dir.join("scene.png"))
+        .arg(dir.join("scene_q60.avif"))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("exact_equal\tfalse"), "{text}");
+    let sim: f64 = text
+        .lines()
+        .find_map(|l| l.strip_prefix("similarity\t"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(sim >= 0.9, "{text}");
+    let out = dupey()
+        .arg("fingerprint")
+        .arg(dir.join("scene_q60.avif"))
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("format\tAvif") && text.contains("width\t192"),
+        "{text}"
+    );
+}
+
+#[test]
+fn unsupported_avif_and_heic_are_handled_without_stopping_the_scan() {
+    let dir = avif_dir("avif-errors");
+    // Lossless identity-matrix AVIF: refused, reported.
+    std::fs::copy(
+        avif_fixture("scene_lossless.avif"),
+        dir.join("lossless.avif"),
+    )
+    .unwrap();
+    std::fs::write(dir.join("broken.avif"), b"\0\0\0\x18ftypavif\0\0\0\0avif").unwrap();
+    // HEIC is never scanned.
+    std::fs::write(dir.join("photo.heic"), b"heic bytes").unwrap();
+    let v = scan_json(&dir, &[]);
+    let errors: Vec<String> = v["errors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["path"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        errors.iter().any(|p| p.ends_with("lossless.avif")),
+        "{errors:?}"
+    );
+    assert!(
+        errors.iter().any(|p| p.ends_with("broken.avif")),
+        "{errors:?}"
+    );
+    assert!(!scanned_paths(&v).iter().any(|p| p.ends_with("photo.heic")));
+    assert!(!errors.iter().any(|p| p.ends_with("photo.heic")));
+    assert_eq!(v["families"].as_array().unwrap().len(), 1);
+}
+
+fn scanned_paths(v: &serde_json::Value) -> Vec<String> {
+    v["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["path"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[test]
+fn images_only_skips_documents_entirely() {
+    let dir = photo_dir("images-only");
+    std::fs::write(dir.join("a.txt"), "quarterly plan\n".repeat(40)).unwrap();
+    std::fs::write(dir.join("b.txt"), "quarterly plan\n".repeat(40)).unwrap();
+    let v = scan_json(&dir, &["--images-only"]);
+    let files = v["files"].as_array().unwrap();
+    assert!(files
+        .iter()
+        .all(|f| !f["path"].as_str().unwrap().ends_with(".txt")));
+    assert_eq!(files.len(), 5, "the five images only");
+    let families = v["families"].as_array().unwrap();
+    assert_eq!(families.len(), 1, "no text family");
+    assert_eq!(
+        names(&families[0]),
+        ["photo.png", "photo_copy.bmp", "photo_small.jpg"]
+    );
+}

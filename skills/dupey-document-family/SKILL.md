@@ -1,6 +1,6 @@
 ---
 name: dupey-document-family
-description: Find, interpret, and safely organize exact duplicates and near-duplicate office document families with dupey. Use when a user asks to inspect duplicate documents, identify revisions, choose a likely latest copy, or prepare a reviewed cleanup plan for txt, md, docx, hwp, hwpx, pptx, xlsx, PDF, or image (png, jpg, gif, bmp, webp, tif) files.
+description: Find, interpret, and safely organize exact duplicates and near-duplicate office document families with dupey. Use when a user asks to inspect duplicate documents, identify revisions, choose a likely latest copy, or prepare a reviewed cleanup plan for txt, md, docx, hwp, hwpx, pptx, xlsx, PDF, or image (png, jpg, gif, bmp, webp, tif, avif) files.
 ---
 
 # Dupey Document Family
@@ -83,7 +83,7 @@ Formatting-only or package-metadata differences can therefore still be
 
 ### Images
 
-Image files (png, jpg, gif, bmp, webp, tif) form their own families, never
+Image files (png, jpg, gif, bmp, webp, tif, avif) form their own families, never
 mixed with documents. `exact` means identical decoded pixels (a PNG re-saved
 as BMP is exact); `near` means a close 128-bit perceptual hash, with
 `hamming` (differing bits) and `near_score = 1 - hamming / 128` as evidence.

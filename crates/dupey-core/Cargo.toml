@@ -28,6 +28,8 @@ sha2.workspace = true
 tempfile = "3"
 thiserror.workspace = true
 walkdir.workspace = true
+zenavif = "0.1.6"
+zenpixels = "0.2"
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
