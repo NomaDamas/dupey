@@ -714,6 +714,7 @@ dependencies = [
  "dupey-core",
  "image",
  "jiff",
+ "libc",
  "rayon",
  "serde",
  "serde_json",

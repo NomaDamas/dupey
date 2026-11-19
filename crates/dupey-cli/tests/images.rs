@@ -398,9 +398,15 @@ fn many_images_scan_into_the_expected_families() {
 }
 
 fn avif_fixture(name: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../dupey-core/tests/fixtures/avif")
-        .join(name)
+    // `DUPEY_AVIF_FIXTURES` lets a test binary built on one machine run on
+    // another (the cross-compiled Windows run), where the baked-in manifest
+    // path does not exist.
+    let base = std::env::var_os("DUPEY_AVIF_FIXTURES")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../dupey-core/tests/fixtures/avif")
+        });
+    base.join(name)
 }
 
 fn avif_dir(name: &str) -> PathBuf {
@@ -532,4 +538,211 @@ fn images_only_skips_documents_entirely() {
         names(&families[0]),
         ["photo.png", "photo_copy.bmp", "photo_small.jpg"]
     );
+}
+
+#[test]
+fn scan_json_lists_skipped_cloud_placeholders_separately_from_errors() {
+    // A normal local folder skips nothing; the field is always present so
+    // callers can rely on it.
+    let dir = photo_dir("skipped-empty");
+    let v = scan_json(&dir, &[]);
+    assert_eq!(v["skipped"], serde_json::json!([]), "{v:#}");
+    assert!(v["errors"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn fingerprint_and_compare_refuse_nothing_for_local_files() {
+    let dir = photo_dir("local-ok");
+    for cmd in ["fingerprint", "compare"] {
+        let mut c = dupey();
+        c.arg(cmd).arg(dir.join("photo.png"));
+        if cmd == "compare" {
+            c.arg(dir.join("photo_copy.bmp"));
+        }
+        assert!(c.output().unwrap().status.success(), "{cmd}");
+    }
+}
+
+/// Real Cloud Files API placeholders, the same kind OneDrive Files On-Demand
+/// creates. `Attributes` cannot be set to these bits from PowerShell or the
+/// .NET enum, so the test registers a sync root and creates placeholders
+/// through `cldapi.dll`, which is what a sync provider does.
+#[cfg(windows)]
+fn create_cloud_placeholders(root: &Path, names: &[&str]) {
+    let list = names
+        .iter()
+        .map(|n| format!("'{n}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let script = format!(
+        r#"
+$ErrorActionPreference = 'Stop'
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class CF {{
+  [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)]
+  public struct SYNC_REG {{ public uint StructSize; [MarshalAs(UnmanagedType.LPWStr)] public string ProviderName; [MarshalAs(UnmanagedType.LPWStr)] public string ProviderVersion; public IntPtr SyncRootIdentity; public uint SyncRootIdentityLength; public IntPtr FileIdentity; public uint FileIdentityLength; public Guid ProviderId; }}
+  [StructLayout(LayoutKind.Sequential)] public struct HYDRATION {{ public ushort Primary; public ushort Modifier; }}
+  [StructLayout(LayoutKind.Sequential)] public struct SYNC_POLICIES {{ public uint StructSize; public HYDRATION Hydration; public HYDRATION Population; public uint InSync; public uint HardLink; public uint PlaceholderManagement; }}
+  [DllImport("cldapi.dll", CharSet=CharSet.Unicode)] public static extern int CfRegisterSyncRoot(string path, ref SYNC_REG reg, ref SYNC_POLICIES pol, uint flags);
+  [StructLayout(LayoutKind.Sequential)] public struct FS_META {{ public long CreationTime; public long LastAccessTime; public long LastWriteTime; public long ChangeTime; public uint FileAttributes; public uint Pad; public long FileSize; }}
+  [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)] public struct PH_CREATE {{ [MarshalAs(UnmanagedType.LPWStr)] public string RelativeFileName; public FS_META FsMetadata; public IntPtr FileIdentity; public uint FileIdentityLength; public uint Flags; public int Result; public long CreateUsn; }}
+  [DllImport("cldapi.dll", CharSet=CharSet.Unicode)] public static extern int CfCreatePlaceholders(string baseDir, [In, Out] PH_CREATE[] entries, uint count, uint flags, out uint processed);
+}}
+"@
+$root = '{root}'
+$id = [Runtime.InteropServices.Marshal]::StringToHGlobalUni('dupey-test')
+$reg = New-Object CF+SYNC_REG
+$reg.StructSize = [Runtime.InteropServices.Marshal]::SizeOf($reg)
+$reg.ProviderName = 'DupeyTest'; $reg.ProviderVersion = '1.0'
+$reg.SyncRootIdentity = $id; $reg.SyncRootIdentityLength = 20; $reg.ProviderId = [Guid]::NewGuid()
+$pol = New-Object CF+SYNC_POLICIES
+$pol.StructSize = [Runtime.InteropServices.Marshal]::SizeOf($pol)
+$pol.Hydration = New-Object CF+HYDRATION; $pol.Hydration.Primary = 2
+$pol.Population = New-Object CF+HYDRATION; $pol.Population.Primary = 2
+$hr = [CF]::CfRegisterSyncRoot($root, [ref]$reg, [ref]$pol, 2)
+if ($hr -ne 0) {{ throw ('CfRegisterSyncRoot 0x{{0:x}}' -f $hr) }}
+$entries = @()
+foreach ($n in @({list})) {{
+  $e = New-Object CF+PH_CREATE
+  $e.RelativeFileName = $n
+  $e.FsMetadata = New-Object CF+FS_META
+  $e.FsMetadata.FileAttributes = 0x20
+  $e.FsMetadata.FileSize = 123456
+  $now = [DateTime]::UtcNow.ToFileTimeUtc()
+  $e.FsMetadata.CreationTime = $now; $e.FsMetadata.LastWriteTime = $now; $e.FsMetadata.LastAccessTime = $now; $e.FsMetadata.ChangeTime = $now
+  $e.FileIdentity = $id; $e.FileIdentityLength = 20; $e.Flags = 1
+  $entries += $e
+}}
+$processed = 0
+$hr = [CF]::CfCreatePlaceholders($root, $entries, $entries.Length, 0, [ref]$processed)
+if ($hr -ne 0 -or $processed -ne $entries.Length) {{ throw ('CfCreatePlaceholders 0x{{0:x}} processed={{1}}' -f $hr, $processed) }}
+"#,
+        root = root.display(),
+        list = list
+    );
+    let out = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            &script,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "cannot create cloud placeholders: {}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_cloud_placeholders_are_skipped_not_read() {
+    // A sync root holds the placeholders; real images live next to it.
+    let dir = photo_dir("win-cloud");
+    let cloud = dir.join("cloud");
+    std::fs::create_dir_all(&cloud).unwrap();
+    create_cloud_placeholders(&cloud, &["online_only.png", "online_only2.jpg"]);
+    save(
+        &cloud,
+        "local_in_sync_root.png",
+        &scene(50, 128, 96),
+        ImageFormat::Png,
+    );
+    let v = scan_json(&dir, &[]);
+    let skipped: Vec<String> = v["skipped"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| {
+            assert_eq!(e["reason"], "cloud_placeholder");
+            Path::new(e["path"].as_str().unwrap())
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    assert_eq!(skipped.len(), 2, "{skipped:?} {v:#}");
+    assert!(skipped.contains(&"online_only.png".to_string()));
+    assert!(skipped.contains(&"online_only2.jpg".to_string()));
+    // Nothing was opened, so nothing failed to decode.
+    assert!(v["errors"].as_array().unwrap().is_empty(), "{v:#}");
+    assert!(!scanned_paths_of(&v)
+        .iter()
+        .any(|p| p.contains("online_only")));
+    // Local files, even inside the sync root, still scan and cluster.
+    assert!(scanned_paths_of(&v)
+        .iter()
+        .any(|p| p.ends_with("local_in_sync_root.png")));
+    assert_eq!(v["families"].as_array().unwrap().len(), 1);
+    // Naming a placeholder directly is refused, not downloaded.
+    let out = dupey()
+        .arg("fingerprint")
+        .arg(cloud.join("online_only.png"))
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("cloud placeholder"));
+}
+
+#[cfg(windows)]
+fn scanned_paths_of(v: &serde_json::Value) -> Vec<String> {
+    v["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["path"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// OneDrive for Mac keeps some placeholders as zero-filled stubs that carry
+/// no `SF_DATALESS` flag, only this extended attribute.
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_onedrive_stub_files_are_skipped_not_reported_as_corrupt() {
+    let dir = photo_dir("mac-onedrive-stub");
+    // A zero-filled "PNG": exactly what such a stub looks like when read.
+    let stub = dir.join("stub.png");
+    std::fs::write(&stub, vec![0u8; 4096]).unwrap();
+    let real_but_unmarked = dir.join("unmarked_zero.png");
+    std::fs::write(&real_but_unmarked, vec![0u8; 4096]).unwrap();
+    let out = Command::new("xattr")
+        .args(["-w", "com.microsoft.OneDrive.Macbox.PhData", "DENO"])
+        .arg(&stub)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let v = scan_json(&dir, &[]);
+    let skipped: Vec<String> = v["skipped"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["path"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(skipped.len(), 1, "{skipped:?}");
+    assert!(skipped[0].ends_with("stub.png"));
+    // Without the marker the same bytes are an honest decode error: only
+    // the placeholder marker earns a skip.
+    let errors: Vec<String> = v["errors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["path"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].ends_with("unmarked_zero.png"));
+    let out = dupey().arg("fingerprint").arg(&stub).output().unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("cloud placeholder"));
 }

@@ -72,6 +72,13 @@ dupey scan ./photos --images-only
 dupey scan ./photos --image-threshold 0.85
 ```
 
+`scan` never downloads cloud files. A file whose data lives on a cloud service
+(OneDrive Files On-Demand and other Windows Cloud Files placeholders, macOS
+`dataless` files, OneDrive for Mac stubs) is listed under `skipped[]` with
+`reason: "cloud_placeholder"` and is not opened; the human summary prints a
+count. `fingerprint` and `compare` refuse such a file instead of fetching it.
+Make a file available offline and it is scanned normally.
+
 `scan` skips common vendor, VCS, and build folders such as `node_modules`,
 `.git`, `target`, `dist`, and `build`.
 
