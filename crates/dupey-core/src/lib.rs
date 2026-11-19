@@ -10,6 +10,7 @@ pub mod family;
 pub mod near;
 pub mod rank;
 pub mod store;
+pub mod visual;
 
 pub use error::{Error, Result};
 pub use exact::{byte_hash, byte_hash_hex, exact_hash, exact_hash_hex};

@@ -42,6 +42,10 @@ families and an explainable latest candidate.
   buffers are sized up front instead of grown by doubling, and files whose
   size hint exceeds 8 MiB run on four dedicated threads under a 1 GiB
   estimated-transient budget
+- Image support: pixel-exact SHA-256 plus a 128-bit perceptual hash (DCT +
+  gradient) in a single streaming decode pass; multi-index hashing finds all
+  pairs within the Hamming budget without all-pairs comparison; image
+  families use the same `families` contract with `hamming` evidence
 - Live end-to-end fixtures, Criterion benchmarks, and corpus benchmarks
 
 ## Next

@@ -28,4 +28,5 @@ serde_json.workspace = true
 walkdir.workspace = true
 
 [dev-dependencies]
+image.workspace = true
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }

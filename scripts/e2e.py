@@ -163,6 +163,43 @@ if xlsx:
         Path(xlsx["pick"]["ranked"][0]["path"]).name == "예산표_v2.xlsx",
     )
 
+photo = family_of("사진.png")
+check("photo family exists", photo is not None)
+if photo:
+    check(
+        "photo family is exact copy + near resize",
+        {Path(m["path"]).name for m in photo["members"]}
+        == {"사진.png", "사진_복사본.bmp", "사진_축소.jpg"},
+    )
+    check("photo family is mixed", photo["relation"] == "mixed", photo["relation"])
+    check(
+        "lossless re-save is exact",
+        member(photo, "사진_복사본.bmp")["relation"] == "exact"
+        or member(photo, "사진.png")["relation"] == "exact",
+    )
+    resized = member(photo, "사진_축소.jpg")
+    check(
+        "downscaled jpeg is near >= 0.90",
+        resized["relation"] == "near" and (resized["near_score"] or 0) >= 0.90,
+        f"near_score={resized['near_score']:.3f} hamming={resized['hamming']}",
+    )
+    check(
+        "photo pick has reasons",
+        bool(photo["pick"]["reasons"]),
+    )
+check(
+    "pixel-identical copies share content_hash",
+    files["사진.png"]["content_hash"] == files["사진_복사본.bmp"]["content_hash"],
+)
+check("image has perceptual hash", len(files["사진.png"]["image_hash"] or "") == 32)
+check("image has no MinHash", files["사진.png"]["fuzzy"] is None)
+check("unrelated picture in no family", family_of("풍경.png") is None)
+check(
+    "flat black and white never merge",
+    family_of("검정.png") is None and family_of("흰색.png") is None,
+)
+check("image dimensions reported", files["사진.png"]["signals"]["width"] == 640)
+
 scan_pdf = files.get("scan.pdf")
 if scan_pdf:
     check("scanned pdf has no fuzzy", scan_pdf["fuzzy"] is None)

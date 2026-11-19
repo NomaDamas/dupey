@@ -31,6 +31,12 @@ pub enum Format {
     Pdf,
     Hwp,
     Hwpx,
+    Png,
+    Jpeg,
+    Gif,
+    Bmp,
+    Webp,
+    Tiff,
 }
 
 impl Format {
@@ -45,8 +51,23 @@ impl Format {
             "pdf" => Some(Self::Pdf),
             "hwp" => Some(Self::Hwp),
             "hwpx" => Some(Self::Hwpx),
+            "png" => Some(Self::Png),
+            "jpg" | "jpeg" => Some(Self::Jpeg),
+            "gif" => Some(Self::Gif),
+            "bmp" => Some(Self::Bmp),
+            "webp" => Some(Self::Webp),
+            "tif" | "tiff" => Some(Self::Tiff),
             _ => None,
         }
+    }
+
+    /// Raster images have no text: [`crate::visual`] fingerprints their
+    /// decoded pixels instead of [`extract`]ing text.
+    pub fn is_image(self) -> bool {
+        matches!(
+            self,
+            Self::Png | Self::Jpeg | Self::Gif | Self::Bmp | Self::Webp | Self::Tiff
+        )
     }
 
     pub fn extract_ready(self) -> bool {
@@ -97,6 +118,12 @@ pub fn extract(path: &Path) -> Result<CanonicalText> {
         Format::Pptx => pptx::extract_pptx(path),
         Format::Xlsx => xlsx::extract_xlsx(path),
         Format::Pdf => pdf::extract_pdf(path),
+        Format::Png | Format::Jpeg | Format::Gif | Format::Bmp | Format::Webp | Format::Tiff => {
+            Err(Error::Extract {
+                path: path.to_path_buf(),
+                message: "images have no text; fingerprint them with dupey_core::visual".into(),
+            })
+        }
     }
 }
 

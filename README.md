@@ -17,7 +17,8 @@
 
 `dupey` extracts comparable text from office documents, detects exact and
 near-duplicate files, groups them into families, and explains which file is
-the best latest-version candidate.
+the best latest-version candidate. Images (`png`, `jpg`, `gif`, `bmp`, `webp`,
+`tif`) are grouped the same way by their decoded pixels and a perceptual hash.
 
 It does **not** use embeddings, upload files, or delete anything.
 
@@ -60,6 +61,12 @@ dupey fingerprint ./documents/proposal.docx
 
 # Compare two versions directly
 dupey compare ./documents/proposal.docx ./documents/proposal-final.docx
+
+# Compare two images (pixel equality + perceptual distance)
+dupey compare ./photos/a.png ./photos/a-small.jpg
+
+# Loosen or tighten the image `near` match (default 0.90 = at most 12 of 128 bits)
+dupey scan ./photos --image-threshold 0.85
 ```
 
 `scan` skips common vendor, VCS, and build folders such as `node_modules`,
@@ -72,6 +79,9 @@ dupey compare ./documents/proposal.docx ./documents/proposal-final.docx
 | `exact` | Extracted document content is identical. |
 | `near` | Documents have high lexical overlap after format-aware extraction. |
 | `contains` | One document substantially contains another. |
+
+For images, `exact` means identical decoded pixels and `near` means a close
+perceptual hash (see [Images](#images)). `contains` never applies to images.
 
 Supported input:
 
@@ -104,6 +114,43 @@ nested structures produce errors instead of a hash of incomplete text.
 with 0.1.2 or earlier. Those versions misread record byte lengths as four-byte
 units and could silently hash incomplete or empty text. Corrected extraction
 changes HWP content hashes and similarity scores.
+
+## Images
+
+| Format | Handling |
+| --- | --- |
+| `png`, `jpg`/`jpeg`, `gif`, `bmp`, `webp`, `tif`/`tiff` | Decoded, EXIF orientation applied, then hashed |
+
+Same rule as documents: dupey never hashes raw file bytes. A PNG re-saved as
+BMP, or a JPEG with rewritten metadata, is `exact` because its decoded RGBA
+pixels hash identically. The codec is chosen from file content, not the
+extension; animated files contribute their first frame.
+
+`near` uses a 128-bit perceptual hash computed in the same single pass over
+the pixels: a 64-bit DCT hash (survives resizing, recompression, and
+brightness shifts) plus a 64-bit gradient hash (rejects structurally
+different pictures). Similarity is `1 - hamming / 128`; `--image-threshold`
+defaults to 0.90 (at most 12 differing bits). Candidates come from
+multi-index hashing, which finds every pair within the threshold without
+comparing all pairs, and each is verified by an exact bit count.
+
+Limits, stated plainly:
+
+- Solid-colour and other detail-free images have no perceptual hash; they
+  only match when pixel-identical, so a black and a white image never merge.
+- Rotated, mirrored, and cropped copies are not detected (EXIF orientation
+  tags are honoured, pixel rotation is not undone).
+- Hashing is luminance-based: a recoloured copy with the same shapes can
+  match.
+- HEIC/AVIF/SVG are not decoded; such files are ignored by `scan`.
+- An image whose header declares more than 1 GiB of decoded pixels is reported
+  in `errors[]` instead of decoded, so a tiny hostile file cannot exhaust memory.
+- Images rank by filesystem modification time only, and `scan --json` adds
+  `signals.width` / `signals.height`, `image_hash`, and `hamming` evidence so
+  you can prefer the highest-resolution copy yourself.
+
+Image families and document families never mix; family ids are unique across
+both.
 
 ## How it works
 

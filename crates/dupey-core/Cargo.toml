@@ -18,6 +18,7 @@ encoding_rs = "0.8.35"
 flate2 = "1.1.9"
 gaoya.workspace = true
 hex.workspace = true
+image.workspace = true
 jiff = { version = "0.2.35", features = ["serde"] }
 pdf_oxide = { version = "0.3.77", default-features = false, features = ["legacy-crypto"] }
 quick-xml = "0.41.0"
