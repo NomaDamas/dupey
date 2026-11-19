@@ -28,7 +28,7 @@ It does **not** use embeddings, upload files, or delete anything.
 cargo install dupey
 ```
 
-Requires Rust 1.91 or newer.
+Requires Rust 1.93 or newer (the pure-Rust AVIF decoder needs it).
 
 ## Install the agent skill
 
