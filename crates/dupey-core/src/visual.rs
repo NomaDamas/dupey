@@ -250,17 +250,31 @@ fn avif_probe(path: &Path) -> Result<zenavif::ImageInfo> {
         })
 }
 
-/// [`decode_avif`] with decoder panics turned into errors.
+/// Stack for the AV1 decoder. Its frame and tile state lives on the stack and
+/// overflows a 256 KiB caller; Windows' 1 MiB main thread overflows on real
+/// photos. A dedicated thread makes the result independent of the caller.
+const AVIF_DECODE_STACK_BYTES: usize = 64 << 20;
+
+/// [`decode_avif`] on its own thread, with decoder panics turned into errors.
 ///
 /// The AV1 decoder indexes out of bounds on some real files (ImageMagick
 /// 4:4:4 screenshots hit its loop-restoration SIMD). One such file must
 /// cost one `errors[]` entry, not the whole scan.
 fn decode_avif_guarded(path: &Path, max_bytes: u64) -> Result<DynamicImage> {
-    std::panic::catch_unwind(|| decode_avif(path, max_bytes)).unwrap_or_else(|_| {
-        Err(Error::Extract {
-            path: path.to_path_buf(),
-            message: "avif: decoder crashed on this file".into(),
-        })
+    let crashed = || Error::Extract {
+        path: path.to_path_buf(),
+        message: "avif: decoder crashed on this file".into(),
+    };
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .stack_size(AVIF_DECODE_STACK_BYTES)
+            .spawn_scoped(scope, || decode_avif(path, max_bytes))
+            .map_err(|e| Error::Io {
+                path: path.to_path_buf(),
+                source: e,
+            })?
+            .join()
+            .unwrap_or_else(|_| Err(crashed()))
     })
 }
 

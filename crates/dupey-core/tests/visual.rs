@@ -606,10 +606,31 @@ fn svt_av1_encoded_avif_of_simple_content_matches_its_source() {
 
 #[test]
 fn avif_that_crashes_the_decoder_is_an_error_not_a_panic() {
-    // A real 9 KB ImageMagick/libheif-written screenshot that makes the
-    // decoder index out of bounds in its loop-restoration code. One such
-    // file must not take down a whole scan.
-    let err = fingerprint(&fixture("decoder_panic.avif"));
-    assert!(err.is_err(), "expected a decode error, got {err:?}");
-    assert!(err.unwrap_err().to_string().contains("decoder crashed"));
+    // A real 9 KB ImageMagick/libheif-written screenshot. On aarch64 the
+    // decoder indexes out of bounds in its NEON loop-restoration code; one
+    // such file must not take down a whole scan. Other CPUs run different
+    // SIMD code and decode it fine, so only the call returning is required
+    // there.
+    let result = fingerprint(&fixture("decoder_panic.avif"));
+    if cfg!(target_arch = "aarch64") {
+        let err = result.expect_err("the aarch64 decoder is known to crash on this file");
+        assert!(err.to_string().contains("decoder crashed"), "{err}");
+    } else if let Ok(fp) = result {
+        assert_eq!((fp.width, fp.height), (800, 489));
+    }
+}
+
+#[test]
+fn avif_decoding_does_not_depend_on_the_callers_stack_size() {
+    // Windows gives the main thread 1 MiB (macOS/Linux: 8 MiB) and the AV1
+    // decoder's frames are large, so `fingerprint`/`compare` called from
+    // `main` overflowed there. Decoding must bring its own stack.
+    let path = fixture("scene_q60.avif");
+    let result = std::thread::Builder::new()
+        .stack_size(256 * 1024)
+        .spawn(move || fingerprint(&path).map(|f| (f.width, f.height)))
+        .unwrap()
+        .join()
+        .expect("decoding overflowed a 256 KiB caller stack");
+    assert_eq!(result.unwrap(), (192, 128));
 }
