@@ -72,6 +72,9 @@ dupey scan ./photos --images-only
 dupey scan ./photos --image-threshold 0.85
 ```
 
+`scan` reports a folder or entry it cannot read (access denied, a link loop) in
+`errors[]` instead of skipping it silently.
+
 `scan` never downloads cloud files. A file whose data lives on a cloud service
 (OneDrive Files On-Demand and other Windows Cloud Files placeholders, macOS
 `dataless` files, OneDrive for Mac stubs) is listed under `skipped[]` with
@@ -97,7 +100,7 @@ Supported input:
 
 | Format | Extraction |
 | --- | --- |
-| `txt`, `md` | UTF-8 text with normalized newlines |
+| `txt`, `md` | UTF-8 or BOM-marked UTF-16 text, newlines normalized (a UTF-8 BOM is ignored); other encodings are reported, not guessed |
 | `docx` | Paragraph text and internal modification metadata |
 | `hwp` | HWP 3.0 (legacy binary) and HWP 5.x (CFB), with compressed/uncompressed body text |
 | `hwpx` | Comparable body text and available internal timestamps |
