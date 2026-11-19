@@ -222,10 +222,21 @@ fn is_avif(path: &Path) -> bool {
         .any(|b| b == b"avif" || b == b"avis")
 }
 
+/// One-line decoder error text. The decoder's errors carry a multi-line
+/// `at <source file>:<line>` trace that names the machine that built it;
+/// only the cause belongs in `errors[]`.
+fn avif_message(e: &dyn std::fmt::Display) -> String {
+    let text = e.to_string();
+    format!(
+        "avif: {}",
+        text.lines().next().unwrap_or("decode error").trim()
+    )
+}
+
 fn avif_decoder(path: &Path, data: &[u8], max_bytes: u64) -> Result<zenavif::ManagedAvifDecoder> {
-    let avif_error = |e: &dyn std::fmt::Debug| Error::Extract {
+    let avif_error = |e: &dyn std::fmt::Display| Error::Extract {
         path: path.to_path_buf(),
-        message: format!("avif: {e:?}"),
+        message: avif_message(e),
     };
     // One thread: the scan already decodes many files in parallel.
     // Backstop for headers that lie: twice what the byte cap allows, so the
@@ -246,7 +257,7 @@ fn avif_probe(path: &Path) -> Result<zenavif::ImageInfo> {
         .probe_info()
         .map_err(|e| Error::Extract {
             path: path.to_path_buf(),
-            message: format!("avif: {e:?}"),
+            message: avif_message(&e),
         })
 }
 
@@ -290,9 +301,7 @@ fn decode_avif(path: &Path, max_bytes: u64) -> Result<DynamicImage> {
         source,
     })?;
     let mut decoder = avif_decoder(path, &data, max_bytes)?;
-    let info = decoder
-        .probe_info()
-        .map_err(|e| err(format!("avif: {e:?}")))?;
+    let info = decoder.probe_info().map_err(|e| err(avif_message(&e)))?;
     let channels = if info.has_alpha { 4 } else { 3 };
     let sample = if info.bit_depth > 8 { 2 } else { 1 };
     let declared = u64::from(info.width) * u64::from(info.height) * channels * sample;
@@ -301,7 +310,7 @@ fn decode_avif(path: &Path, max_bytes: u64) -> Result<DynamicImage> {
     }
     let (pixels, info) = decoder
         .decode_full(&zenavif::Unstoppable)
-        .map_err(|e| err(format!("avif: {e:?}")))?;
+        .map_err(|e| err(avif_message(&e)))?;
     drop(data);
     // zenavif converts an identity matrix (lossless RGB stored as GBR
     // planes) as if it were BT.601, which silently corrupts colours. A wrong

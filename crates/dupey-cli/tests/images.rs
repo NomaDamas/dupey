@@ -746,3 +746,34 @@ fn macos_onedrive_stub_files_are_skipped_not_reported_as_corrupt() {
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("cloud placeholder"));
 }
+
+/// A folder the scan cannot read must show up in `errors[]`: silently
+/// dropping it would let a whole subtree look like "no duplicates here".
+#[cfg(unix)]
+#[test]
+fn unreadable_directories_are_reported_not_silently_dropped() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = photo_dir("unreadable-dir");
+    let locked = dir.join("locked_folder");
+    std::fs::create_dir_all(&locked).unwrap();
+    std::fs::copy(dir.join("photo.png"), locked.join("hidden_copy.png")).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    // Root ignores permission bits; the check is only meaningful otherwise.
+    let readable = std::fs::read_dir(&locked).is_ok();
+
+    let v = scan_json(&dir, &[]);
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    if readable {
+        return;
+    }
+    let errors: Vec<String> = v["errors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["path"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].ends_with("locked_folder"), "{errors:?}");
+    // The rest of the tree is still scanned.
+    assert_eq!(v["families"].as_array().unwrap().len(), 1);
+}

@@ -522,13 +522,25 @@ fn scan(
     let skip = skip::skip_set(extra_exclude);
     let mut paths: Vec<PathBuf> = Vec::new();
     let mut skipped: Vec<SkippedEntry> = Vec::new();
-    for entry in walkdir::WalkDir::new(dir)
-        .into_iter()
-        .filter_entry(|e| {
-            !skip::should_skip_dir(e.file_name(), e.file_type().is_dir(), e.depth(), &skip)
-        })
-        .filter_map(|e| e.ok())
-    {
+    let mut walk_errors: Vec<ErrorEntry> = Vec::new();
+    for entry in walkdir::WalkDir::new(dir).into_iter().filter_entry(|e| {
+        !skip::should_skip_dir(e.file_name(), e.file_type().is_dir(), e.depth(), &skip)
+    }) {
+        let entry = match entry {
+            Ok(entry) => entry,
+            // A folder or entry that cannot be read (permission denied, a
+            // vanished file, a link loop). Dropping it silently would make a
+            // whole subtree look duplicate-free, so it is reported.
+            Err(e) => {
+                walk_errors.push(ErrorEntry {
+                    path: e
+                        .path()
+                        .map_or_else(|| dir.display().to_string(), |p| p.display().to_string()),
+                    error: e.to_string(),
+                });
+                continue;
+            }
+        };
         if entry.file_type().is_file()
             && Format::from_path(entry.path()).is_some_and(|f| !images_only || f.is_image())
         {
@@ -549,6 +561,8 @@ fn scan(
     }
     paths.sort();
     skipped.sort_by(|a, b| a.path.cmp(&b.path));
+    walk_errors.sort_by(|a, b| a.path.cmp(&b.path));
+    errors.extend(walk_errors);
 
     // Extract + hash + signature is the scan bottleneck; it is pure I/O
     // and CPU per file, so it parallelizes cleanly. Order is preserved.

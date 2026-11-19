@@ -634,3 +634,29 @@ fn avif_decoding_does_not_depend_on_the_callers_stack_size() {
         .expect("decoding overflowed a 256 KiB caller stack");
     assert_eq!(result.unwrap(), (192, 128));
 }
+
+#[test]
+fn avif_errors_are_one_line_without_build_machine_paths() {
+    // The decoder's Debug output carries a multi-line `at <file>:<line>`
+    // trace naming the machine that built it. Error text goes into JSON and
+    // line-oriented tools: keep it to the cause.
+    let mut damaged = std::fs::read(fixture("scene_q60.avif")).unwrap();
+    damaged.truncate(damaged.len() / 2);
+    let truncated = tmp("one-line.avif");
+    std::fs::write(&truncated, damaged).unwrap();
+    let garbage = tmp("one-line-garbage.avif");
+    std::fs::write(&garbage, b"\0\0\0\x18ftypavif\0\0\0\0avif").unwrap();
+    for path in [truncated, garbage, fixture("scene_lossless.avif")] {
+        let message = fingerprint(&path).unwrap_err().to_string();
+        assert!(!message.contains('\n'), "multi-line error: {message:?}");
+        assert!(
+            !message.contains("/.cargo/"),
+            "build path leaked: {message:?}"
+        );
+        assert!(
+            !message.contains("registry"),
+            "build path leaked: {message:?}"
+        );
+        assert!(message.contains("avif"), "{message:?}");
+    }
+}
