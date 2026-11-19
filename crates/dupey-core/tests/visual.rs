@@ -634,18 +634,3 @@ fn avif_decoding_does_not_depend_on_the_callers_stack_size() {
         .expect("decoding overflowed a 256 KiB caller stack");
     assert_eq!(result.unwrap(), (192, 128));
 }
-
-#[test]
-fn avif_decoding_does_not_depend_on_the_callers_stack_size() {
-    // Windows gives the main thread 1 MiB (macOS/Linux: 8 MiB) and the AV1
-    // decoder's frames are large, so `fingerprint`/`compare` called from
-    // `main` overflowed there. Decoding must bring its own stack.
-    let path = fixture("scene_q60.avif");
-    let result = std::thread::Builder::new()
-        .stack_size(256 * 1024)
-        .spawn(move || fingerprint(&path).map(|f| (f.width, f.height)))
-        .unwrap()
-        .join()
-        .expect("decoding overflowed a 256 KiB caller stack");
-    assert_eq!(result.unwrap(), (192, 128));
-}
