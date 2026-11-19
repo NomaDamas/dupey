@@ -18,7 +18,7 @@
 `dupey` extracts comparable text from office documents, detects exact and
 near-duplicate files, groups them into families, and explains which file is
 the best latest-version candidate. Images (`png`, `jpg`, `gif`, `bmp`, `webp`,
-`tif`) are grouped the same way by their decoded pixels and a perceptual hash.
+`tif`, `avif`) are grouped the same way by their decoded pixels and a perceptual hash.
 
 It does **not** use embeddings, upload files, or delete anything.
 
@@ -28,7 +28,7 @@ It does **not** use embeddings, upload files, or delete anything.
 cargo install dupey
 ```
 
-Requires Rust 1.91 or newer.
+Requires Rust 1.93 or newer (the pure-Rust AVIF decoder needs it).
 
 ## Install the agent skill
 
@@ -64,6 +64,9 @@ dupey compare ./documents/proposal.docx ./documents/proposal-final.docx
 
 # Compare two images (pixel equality + perceptual distance)
 dupey compare ./photos/a.png ./photos/a-small.jpg
+
+# Only look at images (documents are not read)
+dupey scan ./photos --images-only
 
 # Loosen or tighten the image `near` match (default 0.90 = at most 12 of 128 bits)
 dupey scan ./photos --image-threshold 0.85
@@ -120,6 +123,7 @@ changes HWP content hashes and similarity scores.
 | Format | Handling |
 | --- | --- |
 | `png`, `jpg`/`jpeg`, `gif`, `bmp`, `webp`, `tif`/`tiff` | Decoded, EXIF orientation applied, then hashed |
+| `avif` | Decoded by a pure-Rust AV1 decoder; `irot`/`imir` applied, alpha composited over white for the hash |
 
 Same rule as documents: dupey never hashes raw file bytes. A PNG re-saved as
 BMP, or a JPEG with rewritten metadata, is `exact` because its decoded RGBA
@@ -142,7 +146,21 @@ Limits, stated plainly:
   tags are honoured, pixel rotation is not undone).
 - Hashing is luminance-based: a recoloured copy with the same shapes can
   match.
-- HEIC/AVIF/SVG are not decoded; such files are ignored by `scan`.
+- HEIC/HEIF and SVG are not decoded; such files are ignored by `scan`. HEIC
+  needs an HEVC decoder, which is encumbered by patents, so it is left out on
+  purpose.
+- Lossless AVIF stored as RGB (identity matrix, e.g. `heif-enc -L`,
+  `avifenc --lossless`) is reported in `errors[]`: the decoder converts it as
+  YCbCr and would return wrong colours, and a wrong hash is worse than none.
+- The pure-Rust AV1 decoder mis-decodes some photos stored by SVT-AV1 (the
+  encoder behind `ffmpeg -c:v libsvtav1`). On 5 real photos encoded at default
+  settings, near matches to the source at the default threshold were: libaom
+  (`heif-enc`, `avifenc`) 5/5, SVT-AV1 8-bit 3/5, SVT-AV1 10-bit 0/5. Identical
+  copies of any AVIF always match each other, so exact duplicates are
+  unaffected; only cross-format or re-encoded near matches of SVT files can
+  be missed.
+- AVIF decoding is about 2-3x slower than JPEG (12 MP: ~375 ms, ~90 MB
+  resident); large AVIFs use the scan's memory-bounded path.
 - An image whose header declares more than 1 GiB of decoded pixels is reported
   in `errors[]` instead of decoded, so a tiny hostile file cannot exhaust memory.
 - Images rank by filesystem modification time only, and `scan --json` adds

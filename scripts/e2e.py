@@ -58,6 +58,17 @@ run(
     "should not be scanned\n", encoding="utf-8"
 )
 
+avif_fixtures = ROOT / "crates" / "dupey-core" / "tests" / "fixtures" / "avif"
+avif_dir = CORPUS / "avif"
+avif_dir.mkdir()
+for source, target in [
+    ("scene.png", "scene.png"),
+    ("scene_q60.avif", "scene_q60.avif"),
+    ("orient6.avif", "phone_photo.avif"),
+]:
+    shutil.copy(avif_fixtures / source, avif_dir / target)
+(avif_dir / "ignored.heic").write_bytes(b"heic is not scanned")
+
 scan_path = TARGET / "e2e-scan.json"
 with scan_path.open("wb") as output:
     run(DUPEY, "scan", CORPUS, "--json", stdout=output)
@@ -199,6 +210,17 @@ check(
     family_of("검정.png") is None and family_of("흰색.png") is None,
 )
 check("image dimensions reported", files["사진.png"]["signals"]["width"] == 640)
+
+avif_family = family_of("scene_q60.avif")
+check("avif family exists", avif_family is not None)
+if avif_family:
+    check(
+        "avif joins its png source and a rotated avif",
+        {Path(m["path"]).name for m in avif_family["members"]}
+        == {"scene.png", "scene_q60.avif", "phone_photo.avif"},
+    )
+    check("avif format reported", files["scene_q60.avif"]["format"] == "avif")
+check("heic is never scanned", "ignored.heic" not in files)
 
 scan_pdf = files.get("scan.pdf")
 if scan_pdf:

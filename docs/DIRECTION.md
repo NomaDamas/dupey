@@ -63,7 +63,7 @@ Scoring is shared. New format support belongs in extraction.
 | `pdf` | Embedded text | Creation metadata | Available |
 | `hwp`, `hwpx` | Body text | Presentation metadata | Available |
 | Scanned PDF | No comparable text without OCR | N/A | Excluded |
-| `png`, `jpg`, `gif`, `bmp`, `webp`, `tif` | Decoded pixels | EXIF, container metadata | Available (perceptual hash, not text) |
+| `png`, `jpg`, `gif`, `bmp`, `webp`, `tif`, `avif` | Decoded pixels | EXIF, container metadata | Available (perceptual hash, not text) |
 
 ## Latest-version signals, not certainty
 

@@ -34,6 +34,7 @@ use image::metadata::Orientation;
 use image::{DynamicImage, ImageDecoder, ImageReader};
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
+use zenpixels::{AlphaMode, PixelFormat};
 
 use crate::error::{Error, Result};
 use crate::family::{Family, FamilyEdge, FamilyMember, Relation, UnionFind};
@@ -60,6 +61,9 @@ const TRANSIENT_BYTES_PER_PIXEL: u64 = 8;
 /// Largest decoded image `fingerprint` will materialise (header-declared
 /// size), so a tiny file that claims gigapixels is refused, not allocated.
 const MAX_DECODED_BYTES: u64 = 1 << 30;
+/// Decoded-image transient per pixel for AVIF: the AV1 frame planes, the
+/// RGB output, and an oriented copy (measured ~7.5 B/px peak at 12 MP).
+const AVIF_TRANSIENT_BYTES_PER_PIXEL: u64 = 12;
 /// Domain tag so an image hash never collides with a text hash.
 const EXACT_DOMAIN: &[u8] = b"dupey-image-v1";
 
@@ -134,6 +138,13 @@ fn decode_error(path: &Path, e: image::ImageError) -> Error {
 /// header alone (no pixels are decoded). 0 when the header is unreadable;
 /// [`fingerprint`] then reports the real error.
 pub fn decode_cost(path: &Path) -> u64 {
+    if is_avif(path) {
+        return avif_probe(path)
+            .map(|info| {
+                u64::from(info.width) * u64::from(info.height) * AVIF_TRANSIENT_BYTES_PER_PIXEL
+            })
+            .unwrap_or(0);
+    }
     reader(path)
         .and_then(|r| r.into_dimensions().map_err(|e| decode_error(path, e)))
         .map(|(w, h)| u64::from(w) * u64::from(h) * TRANSIENT_BYTES_PER_PIXEL)
@@ -153,26 +164,231 @@ pub fn max_distance(threshold: f64) -> u32 {
 /// Decode `path` and compute its exact and perceptual fingerprints.
 ///
 /// The codec is chosen from the file's content, not its extension. Animated
-/// formats contribute their first frame.
+/// formats contribute their first frame. AVIF is decoded by a pure-Rust AV1
+/// decoder; HEIC/HEIF (HEVC) is deliberately not supported.
 pub fn fingerprint(path: &Path) -> Result<ImageFingerprint> {
+    let img = if is_avif(path) {
+        decode_avif_guarded(path, MAX_DECODED_BYTES)?
+    } else {
+        decode_raster(path)?
+    };
+    Ok(fingerprint_pixels(&img))
+}
+
+/// Decode a PNG/JPEG/GIF/BMP/WebP/TIFF with EXIF orientation applied.
+fn decode_raster(path: &Path) -> Result<DynamicImage> {
     let mut decoder = reader(path)?
         .into_decoder()
         .map_err(|e| decode_error(path, e))?;
     let declared = decoder.total_bytes();
     if declared > MAX_DECODED_BYTES {
-        return Err(Error::Extract {
-            path: path.to_path_buf(),
-            message: format!(
-                "image too large to decode: {declared} bytes of pixels, limit {MAX_DECODED_BYTES}"
-            ),
-        });
+        return Err(too_large(path, declared, MAX_DECODED_BYTES));
     }
     let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
     let mut img = DynamicImage::from_decoder(decoder).map_err(|e| decode_error(path, e))?;
     if orientation != Orientation::NoTransforms {
         img.apply_orientation(orientation);
     }
-    Ok(fingerprint_pixels(&img))
+    Ok(img)
+}
+
+fn too_large(path: &Path, declared: u64, limit: u64) -> Error {
+    Error::Extract {
+        path: path.to_path_buf(),
+        message: format!("image too large to decode: {declared} bytes of pixels, limit {limit}"),
+    }
+}
+
+/// Whether the file starts with an `ftyp` box naming `avif` or `avis`.
+/// HEIC/HEIF carry other brands and are left to the raster path, which
+/// reports them as unsupported.
+fn is_avif(path: &Path) -> bool {
+    use std::io::Read;
+    let mut head = [0u8; 64];
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let n = file.read(&mut head).unwrap_or(0);
+    if n < 16 || &head[4..8] != b"ftyp" {
+        return false;
+    }
+    let size = u32::from_be_bytes([head[0], head[1], head[2], head[3]]) as usize;
+    let end = size.clamp(16, n);
+    // major brand, then (skipping minor version) compatible brands.
+    let major = &head[8..12];
+    let compatible = head[16..end].chunks_exact(4);
+    std::iter::once(major)
+        .chain(compatible)
+        .any(|b| b == b"avif" || b == b"avis")
+}
+
+fn avif_decoder(path: &Path, data: &[u8], max_bytes: u64) -> Result<zenavif::ManagedAvifDecoder> {
+    let avif_error = |e: &dyn std::fmt::Debug| Error::Extract {
+        path: path.to_path_buf(),
+        message: format!("avif: {e:?}"),
+    };
+    // One thread: the scan already decodes many files in parallel.
+    // Backstop for headers that lie: twice what the byte cap allows, so the
+    // explicit size check above it reports ordinary oversize files.
+    let max_pixels = u32::try_from(max_bytes / 3 * 2).unwrap_or(u32::MAX);
+    let config = zenavif::DecoderConfig::new()
+        .threads(1)
+        .frame_size_limit(max_pixels);
+    zenavif::ManagedAvifDecoder::new(data, &config).map_err(|e| avif_error(&e))
+}
+
+fn avif_probe(path: &Path) -> Result<zenavif::ImageInfo> {
+    let data = std::fs::read(path).map_err(|source| Error::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    avif_decoder(path, &data, MAX_DECODED_BYTES)?
+        .probe_info()
+        .map_err(|e| Error::Extract {
+            path: path.to_path_buf(),
+            message: format!("avif: {e:?}"),
+        })
+}
+
+/// Stack for the AV1 decoder. Its frame and tile state lives on the stack and
+/// overflows a 256 KiB caller; Windows' 1 MiB main thread overflows on real
+/// photos. A dedicated thread makes the result independent of the caller.
+const AVIF_DECODE_STACK_BYTES: usize = 64 << 20;
+
+/// [`decode_avif`] on its own thread, with decoder panics turned into errors.
+///
+/// The AV1 decoder indexes out of bounds on some real files (ImageMagick
+/// 4:4:4 screenshots hit its loop-restoration SIMD). One such file must
+/// cost one `errors[]` entry, not the whole scan.
+fn decode_avif_guarded(path: &Path, max_bytes: u64) -> Result<DynamicImage> {
+    let crashed = || Error::Extract {
+        path: path.to_path_buf(),
+        message: "avif: decoder crashed on this file".into(),
+    };
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .stack_size(AVIF_DECODE_STACK_BYTES)
+            .spawn_scoped(scope, || decode_avif(path, max_bytes))
+            .map_err(|e| Error::Io {
+                path: path.to_path_buf(),
+                source: e,
+            })?
+            .join()
+            .unwrap_or_else(|_| Err(crashed()))
+    })
+}
+
+/// Decode an AVIF to 8/16-bit pixels with `irot`/`imir` applied. Rotation
+/// comes first, then the mirror, the order the container defines.
+fn decode_avif(path: &Path, max_bytes: u64) -> Result<DynamicImage> {
+    let err = |message: String| Error::Extract {
+        path: path.to_path_buf(),
+        message,
+    };
+    let data = std::fs::read(path).map_err(|source| Error::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut decoder = avif_decoder(path, &data, max_bytes)?;
+    let info = decoder
+        .probe_info()
+        .map_err(|e| err(format!("avif: {e:?}")))?;
+    let channels = if info.has_alpha { 4 } else { 3 };
+    let sample = if info.bit_depth > 8 { 2 } else { 1 };
+    let declared = u64::from(info.width) * u64::from(info.height) * channels * sample;
+    if declared > max_bytes {
+        return Err(too_large(path, declared, max_bytes));
+    }
+    let (pixels, info) = decoder
+        .decode_full(&zenavif::Unstoppable)
+        .map_err(|e| err(format!("avif: {e:?}")))?;
+    drop(data);
+    // zenavif converts an identity matrix (lossless RGB stored as GBR
+    // planes) as if it were BT.601, which silently corrupts colours. A wrong
+    // pixel hash is worse than no hash: refuse the file.
+    if info.matrix_coefficients == zenavif::MatrixCoefficients::IDENTITY {
+        return Err(err(
+            "avif: lossless RGB (identity matrix) is not supported by the decoder".into(),
+        ));
+    }
+    let mut img = avif_to_image(pixels).map_err(err)?;
+    let rotation = match info.rotation.map_or(0, |r| r.angle) {
+        90 => Orientation::Rotate270,
+        180 => Orientation::Rotate180,
+        270 => Orientation::Rotate90,
+        _ => Orientation::NoTransforms,
+    };
+    // libheif and libavif write axis 1 for a left-right flip (EXIF 2) and
+    // axis 0 for a top-bottom flip; heif-dec agrees on the fixtures.
+    let mirror = match info.mirror.map(|m| m.axis) {
+        Some(0) => Orientation::FlipVertical,
+        Some(_) => Orientation::FlipHorizontal,
+        None => Orientation::NoTransforms,
+    };
+    for step in [rotation, mirror] {
+        if step != Orientation::NoTransforms {
+            img.apply_orientation(step);
+        }
+    }
+    Ok(img)
+}
+
+/// Move the decoder's pixel buffer into a `DynamicImage` without a copy
+/// when its rows are tightly packed.
+fn avif_to_image(pixels: zenavif::PixelBuffer) -> std::result::Result<DynamicImage, String> {
+    let (w, h) = (pixels.width(), pixels.height());
+    let descriptor = pixels.descriptor();
+    // Straight alpha is guaranteed by the decoder; premultiplied input is
+    // un-premultiplied before it gets here.
+    debug_assert!(descriptor.alpha != Some(AlphaMode::Premultiplied));
+    let format = descriptor.format;
+    let row_bytes = w as usize * format.bytes_per_pixel();
+    let stride = pixels.stride();
+    let mut bytes = if stride == row_bytes {
+        pixels.into_vec()
+    } else {
+        let slice = pixels.as_slice();
+        let mut packed = Vec::with_capacity(row_bytes * h as usize);
+        for y in 0..h {
+            packed.extend_from_slice(&slice.row(y)[..row_bytes]);
+        }
+        packed
+    };
+    bytes.truncate(row_bytes * h as usize);
+    let u16s = |bytes: &[u8]| -> Vec<u16> {
+        bytes
+            .chunks_exact(2)
+            .map(|b| u16::from_ne_bytes([b[0], b[1]]))
+            .collect()
+    };
+    let bad = || format!("avif: unexpected pixel buffer for {w}x{h} {format:?}");
+    Ok(match format {
+        PixelFormat::Rgb8 => {
+            DynamicImage::ImageRgb8(image::RgbImage::from_raw(w, h, bytes).ok_or_else(bad)?)
+        }
+        PixelFormat::Rgba8 => {
+            DynamicImage::ImageRgba8(image::RgbaImage::from_raw(w, h, bytes).ok_or_else(bad)?)
+        }
+        PixelFormat::Gray8 => {
+            DynamicImage::ImageLuma8(image::GrayImage::from_raw(w, h, bytes).ok_or_else(bad)?)
+        }
+        PixelFormat::GrayA8 => {
+            DynamicImage::ImageLumaA8(image::GrayAlphaImage::from_raw(w, h, bytes).ok_or_else(bad)?)
+        }
+        PixelFormat::Rgb16 => DynamicImage::ImageRgb16(
+            image::ImageBuffer::from_raw(w, h, u16s(&bytes)).ok_or_else(bad)?,
+        ),
+        PixelFormat::Rgba16 => DynamicImage::ImageRgba16(
+            image::ImageBuffer::from_raw(w, h, u16s(&bytes)).ok_or_else(bad)?,
+        ),
+        PixelFormat::Gray16 => DynamicImage::ImageLuma16(
+            image::ImageBuffer::from_raw(w, h, u16s(&bytes)).ok_or_else(bad)?,
+        ),
+        PixelFormat::GrayA16 => DynamicImage::ImageLumaA16(
+            image::ImageBuffer::from_raw(w, h, u16s(&bytes)).ok_or_else(bad)?,
+        ),
+        other => return Err(format!("avif: unsupported pixel format {other:?}")),
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -181,6 +397,12 @@ enum Layout {
     La,
     Rgb,
     Rgba,
+}
+
+/// Raw samples of a decoded image: 8-bit bytes or 16-bit words.
+enum Samples<'a> {
+    Eight(Layout, &'a [u8]),
+    Sixteen(Layout, &'a [u16]),
 }
 
 impl Layout {
@@ -199,6 +421,15 @@ fn luma(r: u8, g: u8, b: u8) -> u8 {
     ((u32::from(r) * 54 + u32::from(g) * 183 + u32::from(b) * 19) >> 8) as u8
 }
 
+fn luma16(r: u16, g: u16, b: u16) -> u16 {
+    ((u32::from(r) * 54 + u32::from(g) * 183 + u32::from(b) * 19) >> 8) as u16
+}
+
+fn over_white16(c: u16, alpha: u16) -> u16 {
+    let (c, a) = (u64::from(c), u64::from(alpha));
+    ((c * a + 65535 * (65535 - a) + 32767) / 65535) as u16
+}
+
 fn over_white(c: u8, alpha: u8) -> u8 {
     let (c, a) = (u32::from(c), u32::from(alpha));
     ((c * a + 255 * (255 - a) + 127) / 255) as u8
@@ -208,19 +439,22 @@ fn over_white(c: u8, alpha: u8) -> u8 {
 /// grids, with nothing materialised but one row of scratch.
 fn fingerprint_pixels(img: &DynamicImage) -> ImageFingerprint {
     let converted;
-    let (layout, bytes): (Layout, &[u8]) = match img {
-        DynamicImage::ImageLuma8(b) => (Layout::L, b.as_raw()),
-        DynamicImage::ImageLumaA8(b) => (Layout::La, b.as_raw()),
-        DynamicImage::ImageRgb8(b) => (Layout::Rgb, b.as_raw()),
-        DynamicImage::ImageRgba8(b) => (Layout::Rgba, b.as_raw()),
+    let samples = match img {
+        DynamicImage::ImageLuma8(b) => Samples::Eight(Layout::L, b.as_raw()),
+        DynamicImage::ImageLumaA8(b) => Samples::Eight(Layout::La, b.as_raw()),
+        DynamicImage::ImageRgb8(b) => Samples::Eight(Layout::Rgb, b.as_raw()),
+        DynamicImage::ImageRgba8(b) => Samples::Eight(Layout::Rgba, b.as_raw()),
+        DynamicImage::ImageLuma16(b) => Samples::Sixteen(Layout::L, b.as_raw()),
+        DynamicImage::ImageLumaA16(b) => Samples::Sixteen(Layout::La, b.as_raw()),
+        DynamicImage::ImageRgb16(b) => Samples::Sixteen(Layout::Rgb, b.as_raw()),
+        DynamicImage::ImageRgba16(b) => Samples::Sixteen(Layout::Rgba, b.as_raw()),
         other => {
-            // 16-bit and float images: quantise once to RGBA8.
+            // Float images: quantise once to RGBA8.
             converted = other.to_rgba8();
-            (Layout::Rgba, converted.as_raw())
+            Samples::Eight(Layout::Rgba, converted.as_raw())
         }
     };
     let (w, h) = (img.width() as usize, img.height() as usize);
-    let stride = w * layout.channels();
 
     let mut hasher = Sha256::new();
     hasher.update(EXACT_DOMAIN);
@@ -229,41 +463,109 @@ fn fingerprint_pixels(img: &DynamicImage) -> ImageFingerprint {
     let mut thumb = Grid::new(w, h, DCT_SIDE, DCT_SIDE);
     let mut grad = Grid::new(w, h, GRAD_COLS, GRAD_ROWS);
     let mut rgba = vec![0u8; w * 4];
-    let mut lum = vec![0u8; w];
+    // Luminance keeps the source's own precision (0..=255 for 8-bit images,
+    // 0..=65535 for 16-bit ones), so a dim 10-bit decode is not crushed
+    // into a handful of 8-bit levels before it is hashed.
+    let mut lum = vec![0u16; w];
+    let flat_stddev = match samples {
+        Samples::Eight(..) => FLAT_STDDEV,
+        // The same 1.5 levels, in units of a 10-bit sample (the lowest depth
+        // that reaches this path): 64 sixteen-bit counts per level.
+        Samples::Sixteen(..) => FLAT_STDDEV * 64.0,
+    };
 
     for y in 0..h {
-        let row = &bytes[y * stride..(y + 1) * stride];
-        match layout {
-            Layout::L => {
-                for (x, &l) in row.iter().enumerate() {
-                    rgba[x * 4..x * 4 + 4].copy_from_slice(&[l, l, l, 255]);
-                    lum[x] = l;
+        match samples {
+            Samples::Eight(layout, bytes) => {
+                let stride = w * layout.channels();
+                let row = &bytes[y * stride..(y + 1) * stride];
+                match layout {
+                    Layout::L => {
+                        for (x, &l) in row.iter().enumerate() {
+                            rgba[x * 4..x * 4 + 4].copy_from_slice(&[l, l, l, 255]);
+                            lum[x] = u16::from(l);
+                        }
+                    }
+                    Layout::La => {
+                        for (x, px) in row.chunks_exact(2).enumerate() {
+                            rgba[x * 4..x * 4 + 4].copy_from_slice(&[px[0], px[0], px[0], px[1]]);
+                            lum[x] = u16::from(over_white(px[0], px[1]));
+                        }
+                    }
+                    Layout::Rgb => {
+                        for (x, px) in row.chunks_exact(3).enumerate() {
+                            rgba[x * 4..x * 4 + 4].copy_from_slice(&[px[0], px[1], px[2], 255]);
+                            lum[x] = u16::from(luma(px[0], px[1], px[2]));
+                        }
+                    }
+                    Layout::Rgba => {
+                        rgba.copy_from_slice(row);
+                        for (x, px) in row.chunks_exact(4).enumerate() {
+                            lum[x] = u16::from(if px[3] == 255 {
+                                luma(px[0], px[1], px[2])
+                            } else {
+                                luma(
+                                    over_white(px[0], px[3]),
+                                    over_white(px[1], px[3]),
+                                    over_white(px[2], px[3]),
+                                )
+                            });
+                        }
+                    }
                 }
             }
-            Layout::La => {
-                for (x, px) in row.chunks_exact(2).enumerate() {
-                    rgba[x * 4..x * 4 + 4].copy_from_slice(&[px[0], px[0], px[0], px[1]]);
-                    lum[x] = over_white(px[0], px[1]);
-                }
-            }
-            Layout::Rgb => {
-                for (x, px) in row.chunks_exact(3).enumerate() {
-                    rgba[x * 4..x * 4 + 4].copy_from_slice(&[px[0], px[1], px[2], 255]);
-                    lum[x] = luma(px[0], px[1], px[2]);
-                }
-            }
-            Layout::Rgba => {
-                rgba.copy_from_slice(row);
-                for (x, px) in row.chunks_exact(4).enumerate() {
-                    lum[x] = if px[3] == 255 {
-                        luma(px[0], px[1], px[2])
-                    } else {
-                        luma(
-                            over_white(px[0], px[3]),
-                            over_white(px[1], px[3]),
-                            over_white(px[2], px[3]),
-                        )
-                    };
+            Samples::Sixteen(layout, words) => {
+                let stride = w * layout.channels();
+                let row = &words[y * stride..(y + 1) * stride];
+                let hi = |v: u16| (v >> 8) as u8;
+                match layout {
+                    Layout::L => {
+                        for (x, &l) in row.iter().enumerate() {
+                            rgba[x * 4..x * 4 + 4].copy_from_slice(&[hi(l), hi(l), hi(l), 255]);
+                            lum[x] = l;
+                        }
+                    }
+                    Layout::La => {
+                        for (x, px) in row.chunks_exact(2).enumerate() {
+                            rgba[x * 4..x * 4 + 4].copy_from_slice(&[
+                                hi(px[0]),
+                                hi(px[0]),
+                                hi(px[0]),
+                                hi(px[1]),
+                            ]);
+                            lum[x] = over_white16(px[0], px[1]);
+                        }
+                    }
+                    Layout::Rgb => {
+                        for (x, px) in row.chunks_exact(3).enumerate() {
+                            rgba[x * 4..x * 4 + 4].copy_from_slice(&[
+                                hi(px[0]),
+                                hi(px[1]),
+                                hi(px[2]),
+                                255,
+                            ]);
+                            lum[x] = luma16(px[0], px[1], px[2]);
+                        }
+                    }
+                    Layout::Rgba => {
+                        for (x, px) in row.chunks_exact(4).enumerate() {
+                            rgba[x * 4..x * 4 + 4].copy_from_slice(&[
+                                hi(px[0]),
+                                hi(px[1]),
+                                hi(px[2]),
+                                hi(px[3]),
+                            ]);
+                            lum[x] = if px[3] == u16::MAX {
+                                luma16(px[0], px[1], px[2])
+                            } else {
+                                luma16(
+                                    over_white16(px[0], px[3]),
+                                    over_white16(px[1], px[3]),
+                                    over_white16(px[2], px[3]),
+                                )
+                            };
+                        }
+                    }
                 }
             }
         }
@@ -272,7 +574,7 @@ fn fingerprint_pixels(img: &DynamicImage) -> ImageFingerprint {
         grad.push_row(y, &lum);
     }
 
-    let hash = dct_hash(&thumb.finish()).map(|dct| {
+    let hash = dct_hash(&thumb.finish(), flat_stddev).map(|dct| {
         let gradient = gradient_hash(&grad.finish());
         PerceptualHash(u128::from(dct) << 64 | u128::from(gradient))
     });
@@ -325,7 +627,7 @@ impl Grid {
         }
     }
 
-    fn push_row(&mut self, y: usize, lum: &[u8]) {
+    fn push_row(&mut self, y: usize, lum: &[u16]) {
         let (r0, r1) = self.y_cells[y];
         if r0 >= r1 {
             return;
@@ -360,11 +662,11 @@ impl Grid {
 /// 64-bit DCT hash of a 32x32 luminance thumbnail, or `None` when it is
 /// flat. The DC term is left out (it only encodes brightness); every other
 /// kept coefficient contributes one bit: above the median of those, or not.
-fn dct_hash(thumb: &[f64]) -> Option<u64> {
+fn dct_hash(thumb: &[f64], flat_stddev: f64) -> Option<u64> {
     let n = DCT_SIDE as f64;
     let mean = thumb.iter().sum::<f64>() / thumb.len() as f64;
     let variance = thumb.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / thumb.len() as f64;
-    if variance.sqrt() < FLAT_STDDEV {
+    if variance.sqrt() < flat_stddev {
         return None;
     }
     // basis[u][x] = cos(pi * (2x + 1) * u / 2N)
@@ -834,6 +1136,16 @@ mod tests {
     }
 
     #[test]
+    fn avif_over_the_byte_cap_is_refused_before_decoding() {
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/avif/scene_q60.avif");
+        // 192 x 128 x 3 = 73_728 bytes of pixels.
+        assert!(decode_avif(&fixture, 73_728).is_ok());
+        let err = decode_avif(&fixture, 73_727).unwrap_err().to_string();
+        assert!(err.contains("too large"), "{err}");
+    }
+
+    #[test]
     fn nothing_to_cluster_yields_no_families() {
         assert!(cluster_images(&[], 0.9).is_empty());
         let one = vec![image(0, Some(1), "a")];
@@ -857,7 +1169,7 @@ mod tests {
     fn grid_averages_blocks_of_a_larger_source() {
         let mut grid = Grid::new(64, 64, 32, 32);
         for y in 0..64 {
-            let row: Vec<u8> = (0..64).map(|x| if x < 32 { 0 } else { 200 }).collect();
+            let row: Vec<u16> = (0..64).map(|x| if x < 32 { 0 } else { 200 }).collect();
             grid.push_row(y, &row);
         }
         let cells = grid.finish();

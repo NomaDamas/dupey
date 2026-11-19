@@ -446,3 +446,191 @@ fn decompression_bomb_headers_are_refused_before_decoding() {
     assert!(err.contains("too large"), "{err}");
     assert!(decode_cost(&path) > 1 << 30, "header cost still readable");
 }
+
+// ---- AVIF -----------------------------------------------------------------
+//
+// Fixtures in tests/fixtures/avif were encoded by libheif's `heif-enc` (an
+// encoder independent of the decoder under test) from `scene.png`, a 192x128
+// asymmetric picture. `orientN.avif` hold the scene pre-rotated so that the
+// EXIF orientation N written by libheif as irot/imir displays it upright.
+
+fn fixture(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/avif")
+        .join(name)
+}
+
+#[test]
+fn avif_extension_is_an_image_format_and_heic_is_not() {
+    assert_eq!(Format::from_path(Path::new("a.avif")), Some(Format::Avif));
+    assert!(Format::Avif.is_image());
+    // HEVC carries patents: HEIC/HEIF stay unsupported.
+    assert_eq!(Format::from_path(Path::new("a.heic")), None);
+    assert_eq!(Format::from_path(Path::new("a.heif")), None);
+}
+
+#[test]
+fn lossless_identity_matrix_avif_is_refused_instead_of_misdecoded() {
+    // The decoder reads identity-matrix (GBR) planes as BT.601: colours come
+    // out wrong, so the file is reported as an error.
+    let err = fingerprint(&fixture("scene_lossless.avif"))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("identity"), "{err}");
+}
+
+#[test]
+fn lossy_avif_is_a_near_duplicate_of_its_source() {
+    let source = hash_of(&fixture("scene.png"));
+    let lossy = hash_of(&fixture("scene_q60.avif"));
+    assert!(source.similarity(lossy) >= DEFAULT_IMAGE_THRESHOLD);
+    let unrelated = hash_of(&save(
+        &DynamicImage::ImageRgb8(scene(21, 192, 128)),
+        "avif-unrelated.png",
+        ImageFormat::Png,
+    ));
+    assert!(unrelated.similarity(lossy) < DEFAULT_IMAGE_THRESHOLD);
+}
+
+#[test]
+fn avif_irot_and_imir_display_the_upright_scene_for_all_eight_orientations() {
+    let upright = hash_of(&fixture("scene.png"));
+    for k in 1..=8 {
+        let fp = fingerprint(&fixture(&format!("orient{k}.avif"))).unwrap();
+        assert_eq!((fp.width, fp.height), (192, 128), "orientation {k} dims");
+        let sim = upright.similarity(fp.hash.unwrap());
+        assert!(sim >= DEFAULT_IMAGE_THRESHOLD, "orientation {k}: {sim:.3}");
+    }
+}
+
+#[test]
+fn avif_alpha_is_composited_over_white() {
+    let source = hash_of(&fixture("alpha.png"));
+    let avif = hash_of(&fixture("alpha.avif"));
+    assert!(source.similarity(avif) >= DEFAULT_IMAGE_THRESHOLD);
+}
+
+#[test]
+fn monochrome_avif_matches_its_gray_source() {
+    let source = hash_of(&fixture("gray.png"));
+    let avif = hash_of(&fixture("gray.avif"));
+    assert!(source.similarity(avif) >= DEFAULT_IMAGE_THRESHOLD);
+}
+
+#[test]
+fn avif_is_recognised_by_content_not_extension() {
+    let bytes = std::fs::read(fixture("scene_q60.avif")).unwrap();
+    let renamed = tmp("really-avif.png");
+    std::fs::write(&renamed, bytes).unwrap();
+    assert_eq!(
+        fingerprint(&renamed).unwrap().exact_hash,
+        fingerprint(&fixture("scene_q60.avif")).unwrap().exact_hash
+    );
+}
+
+#[test]
+fn damaged_avif_is_an_error_not_a_panic() {
+    let bytes = std::fs::read(fixture("scene_q60.avif")).unwrap();
+    let truncated = tmp("truncated.avif");
+    std::fs::write(&truncated, &bytes[..bytes.len() / 2]).unwrap();
+    assert!(fingerprint(&truncated).is_err());
+    let mut flipped = bytes.clone();
+    for b in flipped.iter_mut().skip(bytes.len() / 2).take(64) {
+        *b ^= 0xFF;
+    }
+    let corrupt = tmp("corrupt.avif");
+    std::fs::write(&corrupt, flipped).unwrap();
+    // Damaged AV1 data may decode to garbage or fail; it must not panic.
+    let _ = fingerprint(&corrupt);
+    let garbage = tmp("garbage.avif");
+    std::fs::write(&garbage, b"not an avif at all").unwrap();
+    assert!(fingerprint(&garbage).is_err());
+}
+
+#[test]
+fn hevc_heif_is_not_decoded_even_when_named_avif() {
+    // Same container, brand rewritten to `heic`: this build has no HEVC
+    // decoder and must say so instead of guessing.
+    let mut bytes = std::fs::read(fixture("scene_q60.avif")).unwrap();
+    let ftyp = bytes.windows(4).position(|w| w == b"ftyp").unwrap();
+    bytes[ftyp + 4..ftyp + 8].copy_from_slice(b"heic");
+    for brand in bytes[ftyp + 8..ftyp + 40].chunks_exact_mut(4) {
+        if brand == b"avif" {
+            brand.copy_from_slice(b"mif1");
+        }
+    }
+    let path = tmp("hevc.avif");
+    std::fs::write(&path, bytes).unwrap();
+    assert!(fingerprint(&path).is_err());
+}
+
+#[test]
+fn avif_decode_cost_comes_from_the_header() {
+    let cost = decode_cost(&fixture("scene_q60.avif"));
+    assert!(cost >= 192 * 128 * 4, "cost {cost}");
+    assert!(cost <= 192 * 128 * 32, "cost {cost}");
+    assert_eq!(decode_cost(&tmp("missing.avif")), 0);
+}
+
+#[test]
+fn dim_sixteen_bit_images_keep_their_structure() {
+    // A 16-bit image that uses only the bottom 1.5% of the range (a dim
+    // HDR/10-bit decode): squeezed into 8 bits it would have 4 levels left.
+    let base = scene(30, 256, 192);
+    let dim = image::ImageBuffer::<Rgb<u16>, Vec<u16>>::from_fn(256, 192, |x, y| {
+        Rgb(base.get_pixel(x, y).0.map(|c| u16::from(c) * 4))
+    });
+    let path = tmp("dim16.png");
+    DynamicImage::ImageRgb16(dim).save(&path).unwrap();
+    let reference = hash_of(&save(
+        &DynamicImage::ImageRgb8(base),
+        "dim16-ref.png",
+        ImageFormat::Png,
+    ));
+    let sim = reference.similarity(hash_of(&path));
+    assert!(
+        sim >= DEFAULT_IMAGE_THRESHOLD,
+        "dim 16-bit similarity {sim:.3}"
+    );
+}
+
+#[test]
+fn svt_av1_encoded_avif_of_simple_content_matches_its_source() {
+    // Only simple content: the decoder is known to mis-decode some photos
+    // from SVT-AV1 streams (see the README), so this does not claim more.
+    for name in ["scene_10bit.avif", "scene_svt8.avif"] {
+        let sim = hash_of(&fixture("scene.png")).similarity(hash_of(&fixture(name)));
+        assert!(sim >= DEFAULT_IMAGE_THRESHOLD, "{name}: {sim:.3}");
+    }
+}
+
+#[test]
+fn avif_that_crashes_the_decoder_is_an_error_not_a_panic() {
+    // A real 9 KB ImageMagick/libheif-written screenshot. On aarch64 the
+    // decoder indexes out of bounds in its NEON loop-restoration code; one
+    // such file must not take down a whole scan. Other CPUs run different
+    // SIMD code and decode it fine, so only the call returning is required
+    // there.
+    let result = fingerprint(&fixture("decoder_panic.avif"));
+    if cfg!(target_arch = "aarch64") {
+        let err = result.expect_err("the aarch64 decoder is known to crash on this file");
+        assert!(err.to_string().contains("decoder crashed"), "{err}");
+    } else if let Ok(fp) = result {
+        assert_eq!((fp.width, fp.height), (800, 489));
+    }
+}
+
+#[test]
+fn avif_decoding_does_not_depend_on_the_callers_stack_size() {
+    // Windows gives the main thread 1 MiB (macOS/Linux: 8 MiB) and the AV1
+    // decoder's frames are large, so `fingerprint`/`compare` called from
+    // `main` overflowed there. Decoding must bring its own stack.
+    let path = fixture("scene_q60.avif");
+    let result = std::thread::Builder::new()
+        .stack_size(256 * 1024)
+        .spawn(move || fingerprint(&path).map(|f| (f.width, f.height)))
+        .unwrap()
+        .join()
+        .expect("decoding overflowed a 256 KiB caller stack");
+    assert_eq!(result.unwrap(), (192, 128));
+}

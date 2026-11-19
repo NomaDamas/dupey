@@ -59,6 +59,9 @@ enum Command {
         /// images as `near`. Pixel-identical images are always `exact`.
         #[arg(long, default_value_t = DEFAULT_IMAGE_THRESHOLD)]
         image_threshold: f64,
+        /// Scan only image files: documents are neither read nor reported
+        #[arg(long)]
+        images_only: bool,
         /// Extra directory names to skip (folder name, not a path). Repeatable.
         /// Merged with builtins: node_modules, .git, target, dist, build, ...
         #[arg(long = "exclude-dir", value_name = "NAME", action = clap::ArgAction::Append)]
@@ -77,6 +80,7 @@ fn main() -> Result<()> {
             contains_threshold,
             contains_min_jaccard,
             image_threshold,
+            images_only,
             exclude_dir,
         } => scan(
             &dir,
@@ -87,6 +91,7 @@ fn main() -> Result<()> {
                 contains_min_jaccard,
             },
             image_threshold,
+            images_only,
             &exclude_dir,
         ),
     }
@@ -471,6 +476,7 @@ fn scan(
     json: bool,
     config: ClusterConfig,
     image_threshold: f64,
+    images_only: bool,
     extra_exclude: &[String],
 ) -> Result<()> {
     anyhow::ensure!(dir.exists(), "scan path does not exist: {}", dir.display());
@@ -493,7 +499,9 @@ fn scan(
         })
         .filter_map(|e| e.ok())
     {
-        if entry.file_type().is_file() && Format::from_path(entry.path()).is_some() {
+        if entry.file_type().is_file()
+            && Format::from_path(entry.path()).is_some_and(|f| !images_only || f.is_image())
+        {
             paths.push(entry.path().to_path_buf());
         }
     }
