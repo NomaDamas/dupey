@@ -105,7 +105,22 @@ fn image_fingerprint(path: &Path) -> Result<ImageFingerprint> {
     visual::fingerprint(path).with_context(|| format!("decode {}", path.display()))
 }
 
+/// Refuse to read a file whose content lives in the cloud: opening it would
+/// download it. `scan` skips these; naming one directly is an explicit ask,
+/// so it gets an explicit error instead of a silent transfer.
+fn refuse_placeholder(path: &Path) -> Result<()> {
+    if std::fs::metadata(path).is_ok_and(|m| skip::is_cloud_placeholder(path, &m)) {
+        anyhow::bail!(
+            "{} is a cloud placeholder (its data is not on this device); \
+             make it available offline first",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
 fn fingerprint(path: &Path) -> Result<()> {
+    refuse_placeholder(path)?;
     if is_image(path) {
         let fp = image_fingerprint(path)?;
         println!("path\t{}", path.display());
@@ -172,6 +187,8 @@ fn compare_images(a: &Path, b: &Path) -> Result<()> {
 }
 
 fn compare(a: &Path, b: &Path) -> Result<()> {
+    refuse_placeholder(a)?;
+    refuse_placeholder(b)?;
     match (is_image(a), is_image(b)) {
         (true, true) => return compare_images(a, b),
         (false, false) => {}
@@ -246,6 +263,15 @@ struct ErrorEntry {
     error: String,
 }
 
+/// Why `scan` did not read a file it found.
+#[derive(Serialize)]
+struct SkippedEntry {
+    path: String,
+    /// `cloud_placeholder`: the bytes live on a cloud service, and reading
+    /// the file would download them.
+    reason: &'static str,
+}
+
 #[derive(Serialize)]
 struct FamilyOut {
     id: u32,
@@ -281,6 +307,9 @@ struct ScanOut<'a> {
     files: Vec<FileEntry<'a>>,
     families: Vec<FamilyOut>,
     errors: Vec<ErrorEntry>,
+    /// Files found but deliberately not read (cloud placeholders). Not
+    /// errors: nothing went wrong, and nothing was downloaded.
+    skipped: Vec<SkippedEntry>,
 }
 
 /// Everything the scan keeps per file after extraction. The extracted text
@@ -492,6 +521,7 @@ fn scan(
 
     let skip = skip::skip_set(extra_exclude);
     let mut paths: Vec<PathBuf> = Vec::new();
+    let mut skipped: Vec<SkippedEntry> = Vec::new();
     for entry in walkdir::WalkDir::new(dir)
         .into_iter()
         .filter_entry(|e| {
@@ -502,10 +532,23 @@ fn scan(
         if entry.file_type().is_file()
             && Format::from_path(entry.path()).is_some_and(|f| !images_only || f.is_image())
         {
-            paths.push(entry.path().to_path_buf());
+            // `entry.metadata()` is the directory entry's own lstat: it never
+            // opens the file, so asking is free even for a placeholder.
+            if entry
+                .metadata()
+                .is_ok_and(|m| skip::is_cloud_placeholder(entry.path(), &m))
+            {
+                skipped.push(SkippedEntry {
+                    path: entry.path().display().to_string(),
+                    reason: "cloud_placeholder",
+                });
+            } else {
+                paths.push(entry.path().to_path_buf());
+            }
         }
     }
     paths.sort();
+    skipped.sort_by(|a, b| a.path.cmp(&b.path));
 
     // Extract + hash + signature is the scan bottleneck; it is pure I/O
     // and CPU per file, so it parallelizes cleanly. Order is preserved.
@@ -667,6 +710,7 @@ fn scan(
         files,
         families: family_out,
         errors,
+        skipped,
     };
 
     if json {
@@ -680,6 +724,12 @@ fn scan(
         println!("scanned {}\t{} files", out.dir, out.files.len());
         for e in &out.errors {
             println!("error\t{}\t{}", e.path, e.error);
+        }
+        if !out.skipped.is_empty() {
+            println!(
+                "skipped {} cloud placeholder file(s) (not downloaded)",
+                out.skipped.len()
+            );
         }
         for f in &out.families {
             println!(

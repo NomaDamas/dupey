@@ -1,8 +1,15 @@
-//! Directory names `scan` does not descend into.
+//! What `scan` does not read: vendor directories by name, and cloud
+//! placeholders by filesystem flag.
 //!
-//! Matching is on a single folder name (case-insensitive), never a path
-//! substring. The walk root itself is never skipped, so `dupey scan
+//! Directory matching is on a single folder name (case-insensitive), never a
+//! path substring. The walk root itself is never skipped, so `dupey scan
 //! node_modules` still reads that folder's own files.
+//!
+//! A cloud placeholder is a file whose bytes live on a remote service (OneDrive
+//! "Files On-Demand", iCloud, Google Drive, Dropbox). Opening one makes the
+//! provider download it, which can transfer gigabytes during a scan or fail
+//! with `EDEADLK` ("Resource deadlock avoided") when the provider is busy.
+//! They are skipped and reported, never read.
 
 use std::collections::HashSet;
 use std::ffi::OsStr;
@@ -65,6 +72,82 @@ fn normalize_dir_name(name: &str) -> Option<String> {
     }
 }
 
+/// `FILE_ATTRIBUTE_OFFLINE`: data is not locally available.
+#[cfg(any(windows, test))]
+const WIN_ATTR_OFFLINE: u32 = 0x0000_1000;
+/// `FILE_ATTRIBUTE_RECALL_ON_OPEN`: opening the file triggers a download.
+#[cfg(any(windows, test))]
+const WIN_ATTR_RECALL_ON_OPEN: u32 = 0x0004_0000;
+/// `FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS`: reading the file triggers a
+/// download. Set on OneDrive Files On-Demand and other Cloud Files API
+/// placeholders.
+#[cfg(any(windows, test))]
+const WIN_ATTR_RECALL_ON_DATA_ACCESS: u32 = 0x0040_0000;
+/// macOS `SF_DATALESS`: the file's data is not on this device.
+#[cfg(any(target_os = "macos", test))]
+const MACOS_SF_DATALESS: u32 = 0x4000_0000;
+/// Extended attribute OneDrive for Mac puts on its zero-filled stub files.
+/// Those stubs carry no `SF_DATALESS` flag, so this is the only marker.
+#[cfg(target_os = "macos")]
+const MACOS_ONEDRIVE_STUB_XATTR: &[u8] = b"com.microsoft.OneDrive.Macbox.PhData\0";
+
+/// Whether Windows file attributes mark a file whose data is not local.
+#[cfg(any(windows, test))]
+fn windows_attrs_are_placeholder(attrs: u32) -> bool {
+    attrs & (WIN_ATTR_OFFLINE | WIN_ATTR_RECALL_ON_OPEN | WIN_ATTR_RECALL_ON_DATA_ACCESS) != 0
+}
+
+/// Whether macOS `st_flags` mark a file whose data is not on this device.
+#[cfg(any(target_os = "macos", test))]
+fn macos_flags_are_placeholder(flags: u32) -> bool {
+    flags & MACOS_SF_DATALESS != 0
+}
+
+/// Whether `path` carries the OneDrive stub marker. One `getxattr` call, and
+/// it never follows a symlink or reads file data.
+#[cfg(target_os = "macos")]
+fn has_onedrive_stub_marker(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: both strings are NUL-terminated and outlive the call; a null
+    // buffer with size 0 only asks for the attribute's length.
+    let len = unsafe {
+        libc::getxattr(
+            c_path.as_ptr(),
+            MACOS_ONEDRIVE_STUB_XATTR.as_ptr().cast(),
+            std::ptr::null_mut(),
+            0,
+            0,
+            libc::XATTR_NOFOLLOW,
+        )
+    };
+    len >= 0
+}
+
+/// Whether `path` (with its `metadata`) is a cloud placeholder: a file whose
+/// content would have to be downloaded to be read. Always false where the
+/// platform has no such marker (Linux).
+pub fn is_cloud_placeholder(path: &Path, metadata: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        let _ = path;
+        windows_attrs_are_placeholder(metadata.file_attributes())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::macos::fs::MetadataExt;
+        macos_flags_are_placeholder(metadata.st_flags()) || has_onedrive_stub_marker(path)
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let _ = (path, metadata);
+        false
+    }
+}
+
 /// Skip this directory entry (and therefore do not walk its children).
 /// Files are never skipped here; `Format::from_path` still decides extract.
 pub fn should_skip_dir(
@@ -114,6 +197,45 @@ mod tests {
         assert!(!skip("node_modules", true, 0, &[]));
         assert!(!skip("node_modules", false, 1, &[]));
         assert!(!skip("LICENSE.md", false, 2, &[]));
+    }
+
+    #[test]
+    fn windows_recall_and_offline_attributes_are_placeholders() {
+        // 0x400000 is what OneDrive sets on a Files On-Demand placeholder.
+        assert!(windows_attrs_are_placeholder(0x0040_0000));
+        assert!(windows_attrs_are_placeholder(0x0040_0000 | 0x20)); // + ARCHIVE
+        assert!(windows_attrs_are_placeholder(0x0004_0000));
+        assert!(windows_attrs_are_placeholder(0x0000_1000));
+        // A plain file, a hidden/system file, and a pinned (hydrated) file.
+        assert!(!windows_attrs_are_placeholder(0x20));
+        assert!(!windows_attrs_are_placeholder(0x20 | 0x2 | 0x4));
+        assert!(!windows_attrs_are_placeholder(0x0008_0000)); // PINNED
+        assert!(!windows_attrs_are_placeholder(0));
+    }
+
+    #[test]
+    fn macos_dataless_flag_is_a_placeholder() {
+        assert!(macos_flags_are_placeholder(0x4000_0000));
+        assert!(macos_flags_are_placeholder(0x4000_0000 | 0x20)); // + SF_ARCHIVED
+        assert!(!macos_flags_are_placeholder(0));
+        assert!(!macos_flags_are_placeholder(0x0000_8000)); // UF_HIDDEN
+    }
+
+    #[test]
+    fn ordinary_local_files_are_not_placeholders() {
+        let dir = std::env::temp_dir().join(format!("dupey-skip-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.png");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(!is_cloud_placeholder(
+            &file,
+            &std::fs::metadata(&file).unwrap()
+        ));
+        assert!(!is_cloud_placeholder(
+            &dir,
+            &std::fs::metadata(&dir).unwrap()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
