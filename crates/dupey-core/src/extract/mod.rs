@@ -172,6 +172,21 @@ pub(crate) fn normalize_newlines(text: &str) -> String {
     out
 }
 
+/// Resolve an XML entity or numeric character reference (`&amp;`, `&#44032;`,
+/// `&#xD55C;`) emitted by quick-xml 0.41 as `Event::GeneralRef` and append it
+/// to `out`. Unknown entity names are ignored rather than failing extraction.
+pub(crate) fn push_xml_ref(out: &mut String, e: &quick_xml::events::BytesRef<'_>) {
+    if e.is_char_ref() {
+        if let Ok(Some(c)) = e.resolve_char_ref() {
+            out.push(c);
+        }
+    } else if let Ok(name) = e.decode() {
+        if let Some(s) = quick_xml::escape::resolve_predefined_entity(&name) {
+            out.push_str(s);
+        }
+    }
+}
+
 /// Read one ZIP entry as UTF-8 text into a buffer sized from the entry's
 /// declared length. Growing a large string by doubling instead leaves a
 /// trail of freed blocks the system allocator may keep cached, which on
