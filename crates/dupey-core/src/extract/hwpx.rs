@@ -9,7 +9,7 @@ use std::path::Path;
 use quick_xml::events::Event;
 use quick_xml::Reader;
 
-use super::{normalize_newlines, read_zip_entry, CanonicalText, DocMeta, Format};
+use super::{normalize_newlines, push_xml_ref, read_zip_entry, CanonicalText, DocMeta, Format};
 use crate::error::{Error, Result};
 
 pub(crate) fn extract_hwpx(path: &Path) -> Result<CanonicalText> {
@@ -70,6 +70,14 @@ fn section_text(xml: &str) -> String {
                 _ => {}
             },
             Ok(Event::Text(e)) if in_text => {
+                if let Ok(s) = e.decode() {
+                    out.push_str(&s);
+                }
+            }
+            Ok(Event::GeneralRef(e)) if in_text => {
+                push_xml_ref(&mut out, &e);
+            }
+            Ok(Event::CData(e)) if in_text => {
                 if let Ok(s) = e.decode() {
                     out.push_str(&s);
                 }
@@ -188,5 +196,17 @@ mod tests {
         assert_eq!(crate::exact_hash(&ta.text), crate::exact_hash(&tb.text));
         let _ = std::fs::remove_file(&pa);
         let _ = std::fs::remove_file(&pb);
+    }
+
+    #[test]
+    fn preserves_xml_entities_and_char_refs() {
+        let bytes = make_hwpx(
+            &["R&amp;D &quot;계획&quot;", "&#44032;&#45208;&#45796;"],
+            "2026-08-01T09:00:00Z",
+        );
+        let path = write_tmp("dupey-hwpx-entities.hwpx", &bytes);
+        let got = extract_hwpx(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(got.text, "R&D \"계획\"\n가나다\n");
     }
 }

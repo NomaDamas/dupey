@@ -7,7 +7,7 @@ use std::path::Path;
 use quick_xml::events::Event;
 use quick_xml::Reader;
 
-use super::{normalize_newlines, read_zip_entry, CanonicalText, DocMeta, Format};
+use super::{normalize_newlines, push_xml_ref, read_zip_entry, CanonicalText, DocMeta, Format};
 use crate::error::{Error, Result};
 
 pub(crate) fn extract_pptx(path: &Path) -> Result<CanonicalText> {
@@ -72,6 +72,14 @@ fn slide_text(xml: &str) -> String {
                 _ => {}
             },
             Ok(Event::Text(e)) if in_text => {
+                if let Ok(s) = e.decode() {
+                    out.push_str(&s);
+                }
+            }
+            Ok(Event::GeneralRef(e)) if in_text => {
+                push_xml_ref(&mut out, &e);
+            }
+            Ok(Event::CData(e)) if in_text => {
                 if let Ok(s) = e.decode() {
                     out.push_str(&s);
                 }
@@ -187,5 +195,17 @@ pub(crate) mod tests {
             "2026-08-02T10:00:00Z"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn preserves_xml_entities_and_char_refs() {
+        let bytes = make_pptx(
+            &["R&amp;D &lt;Q1&gt;", "&#44032;&#45208;&#45796;"],
+            "2026-08-02T10:00:00Z",
+        );
+        let path = write_tmp("dupey-pptx-entities.pptx", &bytes);
+        let got = extract_pptx(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(got.text, "R&D <Q1>\n가나다\n");
     }
 }

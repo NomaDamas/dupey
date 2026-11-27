@@ -7,7 +7,7 @@ use std::path::Path;
 use quick_xml::events::Event;
 use quick_xml::Reader;
 
-use super::{normalize_newlines, read_zip_entry, CanonicalText, DocMeta, Format};
+use super::{normalize_newlines, push_xml_ref, read_zip_entry, CanonicalText, DocMeta, Format};
 use crate::error::{Error, Result};
 
 pub(crate) fn extract_xlsx(path: &Path) -> Result<CanonicalText> {
@@ -80,6 +80,16 @@ fn shared_strings(xml: &str) -> Vec<String> {
                 _ => {}
             },
             Ok(Event::Text(e)) if in_t => {
+                if let (Some(cur), Ok(s)) = (cur.as_mut(), e.decode()) {
+                    cur.push_str(&s);
+                }
+            }
+            Ok(Event::GeneralRef(e)) if in_t => {
+                if let Some(cur) = cur.as_mut() {
+                    push_xml_ref(cur, &e);
+                }
+            }
+            Ok(Event::CData(e)) if in_t => {
                 if let (Some(cur), Ok(s)) = (cur.as_mut(), e.decode()) {
                     cur.push_str(&s);
                 }
@@ -179,6 +189,9 @@ fn sheet_text(
     let mut cell_is_shared = false;
     let mut cell_is_date = false;
     let mut in_v = false;
+    let mut v_buf = String::new();
+    let mut in_is = false;
+    let mut in_is_t = false;
     let mut in_row = false;
     let mut cells_in_row = 0usize;
     loop {
@@ -203,7 +216,12 @@ fn sheet_text(
                     }
                     cells_in_row += 1;
                 }
-                b"v" => in_v = true,
+                b"v" => {
+                    in_v = true;
+                    v_buf.clear();
+                }
+                b"is" => in_is = true,
+                b"t" if in_is => in_is_t = true,
                 _ => {}
             },
             Ok(Event::End(e)) => match e.local_name().as_ref() {
@@ -211,25 +229,63 @@ fn sheet_text(
                     out.push('\n');
                     in_row = false;
                 }
-                b"v" => in_v = false,
+                b"v" => {
+                    if in_v {
+                        if cell_is_shared {
+                            if let Some(v) = v_buf
+                                .trim()
+                                .parse::<usize>()
+                                .ok()
+                                .and_then(|i| shared.get(i))
+                            {
+                                out.push_str(v);
+                            }
+                        } else if cell_is_date {
+                            if let Some(d) =
+                                v_buf.trim().parse::<f64>().ok().and_then(serial_to_date)
+                            {
+                                out.push_str(&d);
+                            } else {
+                                out.push_str(&v_buf);
+                            }
+                        } else {
+                            out.push_str(&v_buf);
+                        }
+                        v_buf.clear();
+                        in_v = false;
+                    }
+                }
+                b"is" => {
+                    in_is = false;
+                    in_is_t = false;
+                }
+                b"t" if in_is => in_is_t = false,
                 _ => {}
             },
             Ok(Event::Text(e)) if in_v => {
                 if let Ok(s) = e.decode() {
-                    if cell_is_shared {
-                        if let Some(v) = s.trim().parse::<usize>().ok().and_then(|i| shared.get(i))
-                        {
-                            out.push_str(v);
-                        }
-                    } else if cell_is_date {
-                        if let Some(d) = s.trim().parse::<f64>().ok().and_then(serial_to_date) {
-                            out.push_str(&d);
-                        } else {
-                            out.push_str(&s);
-                        }
-                    } else {
-                        out.push_str(&s);
-                    }
+                    v_buf.push_str(&s);
+                }
+            }
+            Ok(Event::GeneralRef(e)) if in_v => {
+                push_xml_ref(&mut v_buf, &e);
+            }
+            Ok(Event::CData(e)) if in_v => {
+                if let Ok(s) = e.decode() {
+                    v_buf.push_str(&s);
+                }
+            }
+            Ok(Event::Text(e)) if in_is_t => {
+                if let Ok(s) = e.decode() {
+                    out.push_str(&s);
+                }
+            }
+            Ok(Event::GeneralRef(e)) if in_is_t => {
+                push_xml_ref(&mut out, &e);
+            }
+            Ok(Event::CData(e)) if in_is_t => {
+                if let Ok(s) = e.decode() {
+                    out.push_str(&s);
                 }
             }
             Ok(Event::Eof) => break,
@@ -433,5 +489,90 @@ mod tests {
             "2026-08-03T11:00:00Z"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    fn make_xlsx_raw_sheet(sheet_xml: &str, sst_xml: Option<&str>) -> Vec<u8> {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut zip = zip::ZipWriter::new(&mut buf);
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            if let Some(sst) = sst_xml {
+                zip.start_file("xl/sharedStrings.xml", opts).unwrap();
+                zip.write_all(sst.as_bytes()).unwrap();
+            }
+            zip.start_file("xl/worksheets/sheet1.xml", opts).unwrap();
+            zip.write_all(sheet_xml.as_bytes()).unwrap();
+            zip.finish().unwrap();
+        }
+        buf.into_inner()
+    }
+
+    #[test]
+    fn extracts_inline_string_cells_and_rich_runs() {
+        let sheet = r#"<?xml version="1.0" encoding="UTF-8"?>
+            <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+              <sheetData>
+                <row r="1">
+                  <c r="A1" t="inlineStr"><is><t>Quarterly revenue</t></is></c>
+                  <c r="B1" t="inlineStr"><is><r><t>Q1 </t></r><r><t>forecast</t></r></is></c>
+                </row>
+                <row r="2">
+                  <c r="A2" t="inlineStr"><is><t>R&amp;D &lt;plan&gt;</t></is></c>
+                  <c r="B2" t="inlineStr"><is><t>&#44032;&#45208;&#45796;</t></is></c>
+                </row>
+              </sheetData>
+            </worksheet>"#;
+        let bytes = make_xlsx_raw_sheet(sheet, None);
+        let path = write_tmp("dupey-xlsx-inline.xlsx", &bytes);
+        let got = extract_xlsx(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            got.text,
+            "Quarterly revenue\tQ1 forecast\nR&D <plan>\t가나다\n"
+        );
+    }
+
+    #[test]
+    fn preserves_xml_entities_and_char_refs_in_shared_strings_and_str_cells() {
+        let sst = r#"<?xml version="1.0" encoding="UTF-8"?>
+            <sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+              <si><t>R&amp;D &quot;budget&quot;</t></si>
+              <si><t>&#44032;&#45208;&#45796; &#xD55C;&#xAE00;</t></si>
+            </sst>"#;
+        let sheet = r#"<?xml version="1.0" encoding="UTF-8"?>
+            <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+              <sheetData>
+                <row r="1">
+                  <c r="A1" t="s"><v>0</v></c>
+                  <c r="B1" t="s"><v>1</v></c>
+                  <c r="C1" t="str"><v>A&amp;B &#44032;</v></c>
+                </row>
+              </sheetData>
+            </worksheet>"#;
+        let bytes = make_xlsx_raw_sheet(sheet, Some(sst));
+        let path = write_tmp("dupey-xlsx-entities.xlsx", &bytes);
+        let got = extract_xlsx(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(got.text, "R&D \"budget\"\t가나다 한글\tA&B 가\n");
+    }
+
+    #[test]
+    fn distinct_inline_string_workbooks_do_not_hash_identically() {
+        let sheet_a = r#"<?xml version="1.0" encoding="UTF-8"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>Quarterly revenue</t></is></c><c r="B1" t="inlineStr"><is><t>Q1 forecast</t></is></c></row></sheetData></worksheet>"#;
+        let sheet_b = r#"<?xml version="1.0" encoding="UTF-8"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>Customer complaints</t></is></c><c r="B1" t="inlineStr"><is><t>Refund requests</t></is></c></row></sheetData></worksheet>"#;
+        let pa = write_tmp(
+            "dupey-xlsx-inline-a.xlsx",
+            &make_xlsx_raw_sheet(sheet_a, None),
+        );
+        let pb = write_tmp(
+            "dupey-xlsx-inline-b.xlsx",
+            &make_xlsx_raw_sheet(sheet_b, None),
+        );
+        let ta = extract_xlsx(&pa).unwrap();
+        let tb = extract_xlsx(&pb).unwrap();
+        let _ = std::fs::remove_file(&pa);
+        let _ = std::fs::remove_file(&pb);
+        assert_ne!(crate::exact_hash(&ta.text), crate::exact_hash(&tb.text));
     }
 }
